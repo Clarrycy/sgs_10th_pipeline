@@ -154,101 +154,50 @@ async function main() {
         window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
     });
 
-    // ── console.log 拦截 + 全面诊断 ─────────────────────────────
+    // ── console.log 拦截 ────────────────────────────────────────
+    // 游戏实际的 console.log 格式（经诊断确认）：
+    //   发送: console.log('%o', '--------[  Sent  ] ID:xxx name:cmsg.XXX detail:', payload)
+    //   接收: console.log('%o', '--------[Received] ID:xxx name:', 'cmsg.CRespXXX', 'detail:', payload)
     await page.evaluateOnNewDocument(() => {
         window.__cap = { msgs: [], hooks: {} };
 
-        // 诊断计数器
-        window.__diag = {
-            hookCalls: 0,
-            logSetAttempts: 0,
-            consoleSetAttempts: 0,
-            samples: [],          // 前 10 次 console.log（初始化阶段）
-            cmsgSamples: [],      // 所有包含 "cmsg" 的 console.log（不限数量）
-            otherMethods: { warn: 0, info: 0, debug: 0, error: 0 },
-            otherSamples: [],
-        };
-
         const _orig = console.log.bind(console);
 
-        // 生成参数摘要（防止序列化爆炸）
-        function _summarize(args) {
-            return args.map(a => {
-                if (a == null) return String(a);
-                if (typeof a === 'string') return a.slice(0, 120);
-                if (typeof a !== 'object') return String(a);
-                // 对象：记录 keys 和关键字段
-                const keys = Object.keys(a).slice(0, 10);
-                const s = { _type: typeof a, _keys: keys };
-                if (a.name) s.name = a.name;
-                if (a.payload !== undefined) s.hasPayload = true;
-                if (a.sent !== undefined) s.hasSent = true;
-                return s;
-            });
+        function _dispatch(name, payload) {
+            const sent = name.startsWith('cmsg.CReq') || name.startsWith('cmsg.CNotify') === false;
+            window.__cap.msgs.push({ name, payload: payload || {}, sent });
+            const waiters = window.__cap.hooks[name];
+            if (waiters && waiters.length) {
+                waiters.splice(0).forEach(fn => fn({ name, payload: payload || {}, sent }));
+            }
         }
 
         const _hook = function (...args) {
             _orig(...args);
-            window.__diag.hookCalls++;
             try {
-                // 前 10 次通用采样
-                if (window.__diag.samples.length < 10) {
-                    window.__diag.samples.push(_summarize(args));
-                }
-                // 所有包含 "cmsg" 的调用单独记录（看协议消息的实际格式）
-                const joined = args.map(a => typeof a === 'string' ? a : '').join(' ');
-                if (joined.includes('cmsg')) {
-                    window.__diag.cmsgSamples.push(_summarize(args));
-                }
-                const m = args[0];
-                if (m && typeof m === 'object' && typeof m.name === 'string' && m.payload != null) {
-                    window.__cap.msgs.push({ name: m.name, payload: m.payload, sent: m.sent });
-                    const waiters = window.__cap.hooks[m.name];
-                    if (waiters && waiters.length) {
-                        waiters.splice(0).forEach(fn => fn(m));
-                    }
+                if (args[0] !== '%o' || typeof args[1] !== 'string') return;
+                const header = args[1];
+                if (!header.startsWith('--------[')) return;
+
+                if (header.includes('[Received]')) {
+                    // 接收: args = ['%o', '--------[Received] ID:xxx name:', 'cmsg.XXX', 'detail:', payload]
+                    const name = typeof args[2] === 'string' ? args[2] : '';
+                    const payload = args[4];
+                    if (name) _dispatch(name, payload);
+                } else if (header.includes('[  Sent  ]') || header.includes('[Cached]')) {
+                    // 发送: args = ['%o', '--------[  Sent  ] ID:xxx name:cmsg.XXX detail:', payload]
+                    const m = header.match(/name:(cmsg\.\w+)/);
+                    if (m) _dispatch(m[1], args[2]);
                 }
             } catch (_) {}
         };
 
-        // 锁住 console.log
+        // 锁住 console.log，防止游戏覆盖
         Object.defineProperty(console, 'log', {
             get: () => _hook,
-            set: () => { window.__diag.logSetAttempts++; },
+            set: () => {},
             configurable: true,
         });
-
-        // 锁住 window.console
-        const _console = console;
-        Object.defineProperty(window, 'console', {
-            get: () => _console,
-            set: () => { window.__diag.consoleSetAttempts++; },
-            configurable: true,
-        });
-
-        // 也 hook console.warn/info/debug/error，看游戏是不是走这些方法
-        for (const method of ['warn', 'info', 'debug', 'error']) {
-            const origMethod = _console[method]?.bind(_console);
-            const methodName = method;
-            _console[method] = function (...args) {
-                if (origMethod) origMethod(...args);
-                window.__diag.otherMethods[methodName]++;
-                if (window.__diag.otherSamples.length < 10) {
-                    window.__diag.otherSamples.push({ method: methodName, args: _summarize(args) });
-                }
-                // 也检查是否有消息格式的对象
-                try {
-                    const m = args[0];
-                    if (m && typeof m === 'object' && typeof m.name === 'string' && m.payload != null) {
-                        window.__cap.msgs.push({ name: m.name, payload: m.payload, sent: m.sent });
-                        const waiters = window.__cap.hooks[m.name];
-                        if (waiters && waiters.length) {
-                            waiters.splice(0).forEach(fn => fn(m));
-                        }
-                    }
-                } catch (_) {}
-            };
-        }
     });
 
     // ── 登录 ────────────────────────────────────────────────────
@@ -349,31 +298,12 @@ async function main() {
     } catch (_) {
         const diag = await page.evaluate(() => {
             const cap = window.__cap;
-            const d = window.__diag || {};
-            const desc = Object.getOwnPropertyDescriptor(console, 'log');
             return {
-                // ① hook 是否存活
-                hookAlive: !!(desc && desc.get),
-                // ② console.log 被调用了多少次
-                hookCalls: d.hookCalls || 0,
-                // ③ 游戏尝试覆盖的次数
-                logSetAttempts: d.logSetAttempts || 0,
-                consoleSetAttempts: d.consoleSetAttempts || 0,
-                // ④ 捕获到的消息
                 msgCount: cap ? cap.msgs.length : -1,
-                msgNames: cap ? [...new Set(cap.msgs.map(m => m.name))] : [],
-                // ⑤ console.log 初始化采样
-                samples: d.samples || [],
-                // ⑥ 所有包含 "cmsg" 的调用（关键！看协议消息格式）
-                cmsgSamples: d.cmsgSamples || [],
-                cmsgCount: (d.cmsgSamples || []).length,
-                // ⑦ 其他 console 方法调用统计
-                otherMethods: d.otherMethods || {},
-                otherSamples: d.otherSamples || [],
+                msgNames: cap ? [...new Set(cap.msgs.map(m => m.name))].slice(0, 20) : [],
             };
         });
-        console.error('❌ 认证超时 — 全面诊断:');
-        console.error(JSON.stringify(diag, null, 2));
+        console.error('❌ 认证超时 — 诊断:', JSON.stringify(diag));
         await browser.close();
         process.exit(1);
     }
