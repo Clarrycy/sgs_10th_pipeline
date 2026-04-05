@@ -156,13 +156,16 @@ async function main() {
 
     // ── console.log 拦截 ────────────────────────────────────────
     await page.evaluateOnNewDocument(() => {
-        // 先创建 __cap，再 hook console.log
-        // 不依赖 document.head（evaluateOnNewDocument 在 document-start 运行时 head 可能不存在）
         window.__cap = { msgs: [], hooks: {} };
 
-        // 保存原始 console.log（不用 iframe 方式，避免 DOM 依赖）
-        const _orig = console.log.bind(console);
-        console.log = function (...args) {
+        // 用 iframe 获取原始 console.log，防止游戏加载后覆盖我们的 hook。
+        // document.documentElement（<html>）在 document-start 时已存在，可安全 appendChild。
+        const iframe = document.createElement('iframe');
+        document.documentElement.appendChild(iframe);
+        const _orig = iframe.contentWindow.console.log.bind(console);
+        iframe.remove();
+
+        const _hook = function (...args) {
             _orig(...args);
             try {
                 const m = args[0];
@@ -175,6 +178,13 @@ async function main() {
                 }
             } catch (_) {}
         };
+
+        // 用 Object.defineProperty 锁住 console.log，游戏再赋值也无法覆盖
+        Object.defineProperty(console, 'log', {
+            get: () => _hook,
+            set: () => {},   // 静默忽略游戏的覆盖尝试
+            configurable: false,
+        });
     });
 
     // ── 登录 ────────────────────────────────────────────────────
