@@ -46,8 +46,8 @@ jobs:
       # ── Puppeteer 采集：官阶榜 + 省级榜 + 好友推荐 → GameID
       - name: Collect GameIDs
         env:
-          SGS_ACCOUNTS:   ${{ secrets.SGS_ACCOUNTS }}
-          SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS }}
+          SGS_ACCOUNTS:   ${{ secrets.SGS_ACCOUNTS || secrets.SGS_ACCOUNT }}
+          SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS || secrets.SGS_PASSWORD }}
           KEEP_MODES:     '8,36'
           PROVINCE_MAX:   '33'
           FRIEND_ROUNDS:  '100'

@@ -49,10 +49,14 @@ const CMD_GET_GAME_RECORD    = 1065628532;  // CReqGetNewGameRecord
 async function main() {
     fs.mkdirSync(GAMEIDS_DIR, { recursive: true });
 
-    const accounts  = (process.env.SGS_ACCOUNTS  || '').split(',').filter(Boolean);
-    const passwords = (process.env.SGS_PASSWORDS || '').split(',').filter(Boolean);
+    // 兼容单数/复数命名，支持中英文逗号，自动去空格
+    const rawAccounts  = process.env.SGS_ACCOUNTS  || process.env.SGS_ACCOUNT  || '';
+    const rawPasswords = process.env.SGS_PASSWORDS || process.env.SGS_PASSWORD || '';
+    const accounts  = rawAccounts.replace(/，/g, ',').split(',').map(s => s.trim()).filter(Boolean);
+    const passwords = rawPasswords.replace(/，/g, ',').split(',').map(s => s.trim()).filter(Boolean);
     if (!accounts.length || accounts.length !== passwords.length) {
         console.error('❌ 缺少环境变量 SGS_ACCOUNTS / SGS_PASSWORDS（逗号分隔，数量需一致）');
+        console.error(`   当前: accounts=${accounts.length}, passwords=${passwords.length}`);
         process.exit(1);
     }
     // 按当前小时轮替账号
