@@ -20,7 +20,8 @@ build/
 # ── macOS
 .DS_Store
 
-# ── Cookie 文件（绝对不要提交）
+# ── 本地文档和 Cookie（绝对不要提交）
+README.zh.md
 cookies.json
 .env
 *.env
