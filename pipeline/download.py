@@ -4,9 +4,14 @@ SGS 录像批量下载脚本
 
 用法:
   python pipeline/download.py [--days=N] [--modes=8,36] [--workers=50]
+  python pipeline/download.py --use-indexes [--days=N] [--workers=50]
   python pipeline/download.py --cleanup --days=30
 
-输入:  data/gameids/*.json（所有 GameID 文件自动合并）
+输入:
+  默认模式:  data/gameids/*.json（所有 GameID 文件自动合并）
+  索引模式:  data/indexes/index_ranked.json + index_doudizhu.json
+             （跳过 identity，仅下载 replayDownloaded=False 的 GameID）
+
 输出:  data/replays/{2v2,doudizhu,other}/  +  data/output/index.csv
 
 去重:  基于 data/output/index.csv（O(1) 查找，下载前过滤）
@@ -14,6 +19,7 @@ SGS 录像批量下载脚本
 支持:
   - aiohttp 异步并发 + HTTP keep-alive 长连接
   - 内存中解析 mode_id → 自动分类到模式子目录
+  - --use-indexes 从 per-mode index JSON 读取待下载列表（跳过身份）
   - --days=N      只下载最近 N 天的对局（按 GameID 时间戳过滤）
   - --modes=8,36  只下载指定模式（8=2v2, 36=斗地主, 4=八人; 默认全部）
   - --workers=N   并发连接数（默认 50）
@@ -52,12 +58,16 @@ MODE_MAP = {
     36: '斗地主',
 }
 
-ROOT      = Path(__file__).resolve().parent.parent
-DATA_DIR  = ROOT / 'data'
+ROOT       = Path(__file__).resolve().parent.parent
+DATA_DIR   = ROOT / 'data'
 REPLAY_DIR = DATA_DIR / 'replays'
 OUTPUT_DIR = DATA_DIR / 'output'
 INDEX_PATH = OUTPUT_DIR / 'index.csv'
 GAMEID_DIR = DATA_DIR / 'gameids'
+INDEXES_DIR = DATA_DIR / 'indexes'
+
+# 索引模式下需要下载的 mode（跳过身份 mode=4）
+DOWNLOAD_MODES = {8, 36}
 
 INDEX_FIELDS = ['GameID', 'mode', '模式', '来源', '对局时间', '下载时间', '文件大小']
 
@@ -182,9 +192,70 @@ def load_all_gameids(source_tag_out=None):
     print(f'   合计去重后: {len(result)} 个')
     return result
 
+# ─────────────────── 索引模式加载 ───────────────────
+
+INDEX_MODE_FILES = {
+    8:  'index_ranked.json',
+    36: 'index_doudizhu.json',
+}
+
+
+def load_gameids_from_indexes():
+    """从 per-mode index JSON 读取 replayDownloaded=False 的 GameID。
+    跳过 identity (mode 4)。返回 list[str]。
+    """
+    result = []
+    seen = set()
+
+    for mode, fname in INDEX_MODE_FILES.items():
+        fp = INDEXES_DIR / fname
+        if not fp.is_file():
+            continue
+        with open(fp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        count = 0
+        for gid, entry in data.get('games', {}).items():
+            if entry.get('replayDownloaded'):
+                continue
+            if gid not in seen:
+                seen.add(gid)
+                result.append(gid)
+                count += 1
+
+        print(f'  📋 {fname}: {count} 个待下载')
+
+    print(f'  合计: {len(result)} 个 GameID（从索引）')
+    return result
+
+
+def update_indexes_downloaded(downloaded_ids):
+    """将成功下载的 GameID 在 per-mode index 中标记 replayDownloaded=True。"""
+    if not downloaded_ids:
+        return
+
+    for mode, fname in INDEX_MODE_FILES.items():
+        fp = INDEXES_DIR / fname
+        if not fp.is_file():
+            continue
+        with open(fp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        updated = 0
+        for gid in downloaded_ids:
+            if gid in data.get('games', {}):
+                data['games'][gid]['replayDownloaded'] = True
+                updated += 1
+
+        if updated > 0:
+            with open(fp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f'  ✅ {fname}: 标记 {updated} 个已下载')
+
+
 # ─────────────────── 异步下载 ───────────────────
 
-async def download_one(session, game_id, allowed_modes, index_writer, sem, source):
+async def download_one(session, game_id, allowed_modes, index_writer, sem, source, downloaded_set):
     url = f'{CDN_BASE}{game_id}.sgs'
     today = time.strftime('%Y-%m-%d')
 
@@ -231,6 +302,7 @@ async def download_one(session, game_id, allowed_modes, index_writer, sem, sourc
         '下载时间': today,
         '文件大小': len(data),
     })
+    downloaded_set.add(game_id)
     return game_id, 'ok', len(data)
 
 
@@ -243,6 +315,7 @@ async def run_downloads(to_download, allowed_modes, workers, source):
     )
     sem = asyncio.Semaphore(workers)
     index_writer = IndexWriter()
+    downloaded_set = set()  # 成功下载的 GameID 集合
 
     ok = err = filtered = 0
     total_bytes = 0
@@ -256,7 +329,7 @@ async def run_downloads(to_download, allowed_modes, workers, source):
         ) as session:
             tasks = [
                 asyncio.ensure_future(
-                    download_one(session, gid, allowed_modes, index_writer, sem, source)
+                    download_one(session, gid, allowed_modes, index_writer, sem, source, downloaded_set)
                 )
                 for gid in to_download
             ]
@@ -285,7 +358,7 @@ async def run_downloads(to_download, allowed_modes, workers, source):
     finally:
         index_writer.close()
 
-    return ok, err, filtered, total_bytes, time.time() - t0
+    return ok, err, filtered, total_bytes, time.time() - t0, downloaded_set
 
 # ─────────────────── 本地清理 ───────────────────
 
@@ -312,6 +385,8 @@ def main():
     ap.add_argument('--workers', type=int, default=50,   help='并发数（默认 50）')
     ap.add_argument('--source',  type=str, default='auto', help='来源标签（写入 index.csv）')
     ap.add_argument('--cleanup', action='store_true', help='清理旧 .sgs 文件（需搭配 --days）')
+    ap.add_argument('--use-indexes', action='store_true',
+                    help='从 per-mode index JSON 读取待下载列表（跳过身份 mode 4）')
     args = ap.parse_args()
 
     # 清理模式
@@ -321,6 +396,8 @@ def main():
         cleanup_old_replays(days)
         return
 
+    use_indexes = getattr(args, 'use_indexes', False)
+
     # 解析模式过滤
     allowed_modes = None
     if args.modes:
@@ -328,7 +405,11 @@ def main():
         print(f'🎯 模式过滤：{allowed_modes}')
 
     # 加载所有 GameID
-    all_ids = load_all_gameids()
+    if use_indexes:
+        print('📋 索引模式：从 per-mode index JSON 读取...')
+        all_ids = load_gameids_from_indexes()
+    else:
+        all_ids = load_all_gameids()
     if not all_ids:
         return
 
@@ -349,13 +430,18 @@ def main():
         return
 
     print(f'🚀 开始下载（并发={args.workers}，keep-alive）...\n')
-    ok, err, filtered, total_bytes, elapsed = asyncio.run(
+    ok, err, filtered, total_bytes, elapsed, downloaded_set = asyncio.run(
         run_downloads(to_download, allowed_modes, args.workers, args.source)
     )
 
     mb = total_bytes / 1024 / 1024
     print(f'\n✅ 完成！成功={ok}  过滤={filtered}  失败={err}')
     print(f'   总大小={mb:.1f}MB  耗时={elapsed:.1f}s')
+
+    # 索引模式：回写 replayDownloaded 标记
+    if use_indexes and downloaded_set:
+        print(f'\n📝 更新索引（{len(downloaded_set)} 个已下载）...')
+        update_indexes_downloaded(downloaded_set)
 
     # 各子目录统计
     for subdir in REPLAY_DIR.iterdir():

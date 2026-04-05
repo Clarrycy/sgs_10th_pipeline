@@ -4,16 +4,17 @@
 /**
  * SGS 全自动采集脚本  collect/collect.js
  *
- * 采集源：
- *   A. 官阶榜 top 500（rankType=20, 自动分页 5×100）
- *   B. 省级排位榜 34 省 × top 100（rankType=5）
- *   C. 好友推荐"换一批"（CReqFriendRecommend, ~20 人/次, 刷 N 轮）
- *   → 所有去重 UserID 查战绩 → GameID
+ * 采集源（A/B/B2 每日缓存，C 每次重新刷）：
+ *   A.  官阶榜 top 500（rankType=20, 自动分页 5×100）
+ *   B.  省级排位榜 34 省 × top 100（rankType=5, modeID=8 2v2）
+ *   B2. 省级身份排位榜 全服+34 省（rankType=5, modeID=4 身份竞技）
+ *   C.  好友推荐"换一批"（CReqFriendRecommend, ~20 人/次, 刷 N 轮）
+ *   → 所有去重 UserID 查战绩 → GameID（含 modeId）
  *
  * 环境变量：
  *   SGS_ACCOUNTS    登录账号（逗号分隔，按小时轮替）
  *   SGS_PASSWORDS   登录密码（逗号分隔，与账号一一对应）
- *   KEEP_MODES      保留的模式 ID（默认 "8,36"）
+ *   KEEP_MODES      保留的模式 ID（默认 "4,8,36"）
  *   PROVINCE_MAX    最大省份 ID（默认 33）
  *   FRIEND_ROUNDS   好友推荐刷新轮数（默认 100，约 2000 人）
  *   REQUEST_DELAY   请求间隔 ms（默认 300）
@@ -30,13 +31,14 @@ const path      = require('path');
 
 const LOGIN_URL      = 'https://web.sanguosha.com/login/index.html';
 const GAME_URL       = 'https://web.sanguosha.com/10/';
-const KEEP_MODES     = (process.env.KEEP_MODES || '8,36').split(',').map(Number);
+const KEEP_MODES     = (process.env.KEEP_MODES || '4,8,36').split(',').map(Number);
 const PROVINCE_MAX   = parseInt(process.env.PROVINCE_MAX || '33', 10);
 const FRIEND_ROUNDS  = parseInt(process.env.FRIEND_ROUNDS || '100', 10);
 const DELAY_MS       = parseInt(process.env.REQUEST_DELAY || '300', 10);
 
 const ROOT        = path.resolve(__dirname, '..');
 const GAMEIDS_DIR = path.join(ROOT, 'data', 'gameids');
+const CACHE_DIR   = path.join(ROOT, 'data', 'cache');
 
 // ─────────────────── cmdId 常量 ───────────────────
 
@@ -150,7 +152,7 @@ async function main() {
             });
         };
 
-        const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4 };
+        const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4, MITShenFenJingji: 4 };
         window.modeToInt = function(m) { return typeof m === 'string' ? (MODE_STR[m] || 0) : (m || 0); };
         window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
     });
@@ -338,56 +340,126 @@ async function main() {
     //  采集阶段
     // ════════════════════════════════════════════════════════════
 
-    // ── Step 1A：官阶榜 top 500 ─────────────────────────────────
-    console.log('\n📊 Step 1A：官阶榜 top 500...');
-    const officialIds = await page.evaluate(async (CMD, delayMs) => {
-        const seen = new Set();
-        // rankType=20(官阶), rangeType=1(全服), modeID=0, provinceID=-1
-        // provinceID=-1 需要用有符号编码：用 zigzag? 不，protobuf3 varint 是无符号的
-        // 但录像中 provinceID=-1 能工作，可能服务端忽略了这个字段
-        // 安全起见不传 provinceID（protobuf3 零值省略）
-        const payload = new Uint8Array([
-            ...encodeField(1, 20),   // rankType = RLTOfficialRank
-            ...encodeField(2, 1),    // rangeType = RLRTTotal
-        ]);
-        const resps = collectMsgs('cmsg.CRespRankList', 20000);
-        window.__psc.Send(CMD, payload);
-        const pages = await resps;
-        for (const p of pages) {
-            for (const u of (p.payload?.rankList || [])) {
-                if (u.userID) seen.add(String(u.userID));
-            }
-        }
-        return { ids: [...seen], pages: pages.length };
-    }, CMD_RANK_LIST, DELAY_MS);
-    console.log(`   ✅ 官阶榜 ${officialIds.pages} 页, ${officialIds.ids.length} 人`);
+    // ── 每日榜单缓存检查 ────────────────────────────────────────
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const cachePath = path.join(CACHE_DIR, `boards_${todayStr}.json`);
+    let boardCache = null;
 
-    // ── Step 1B：省级排位榜 ─────────────────────────────────────
-    console.log(`\n📊 Step 1B：省级排位榜（${PROVINCE_MAX + 1} 个省份）...`);
-    const provinceIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
-        const seen = new Set();
-        for (let pid = 0; pid <= provinceMax; pid++) {
+    if (fs.existsSync(cachePath)) {
+        boardCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+        console.log(`\n📦 榜单缓存命中：${cachePath}`);
+        console.log(`   官阶 ${boardCache.officialRank.count} 人 | 省级排位 ${boardCache.provincial.count} 人 | 省级身份 ${boardCache.provincialIdentity.count} 人`);
+    }
+
+    let officialRankIds, provinceRankedIds, provinceIdentityIds;
+
+    if (boardCache) {
+        // ── 使用缓存，跳过 Step 1A + 1B + 1B2 ─────────────────
+        officialRankIds   = boardCache.officialRank.ids;
+        provinceRankedIds = boardCache.provincial.ids;
+        provinceIdentityIds = boardCache.provincialIdentity.ids;
+    } else {
+        // ── Step 1A：官阶榜 top 500 ─────────────────────────────
+        console.log('\n📊 Step 1A：官阶榜 top 500...');
+        const officialResult = await page.evaluate(async (CMD, delayMs) => {
+            const seen = new Set();
             const payload = new Uint8Array([
-                ...encodeField(1, 5),    // rankType = 排位
-                ...encodeField(2, 3),    // rangeType = 省级
-                ...encodeField(3, 8),    // modeID = 欢乐竞技
-                ...encodeField(4, pid),
+                ...encodeField(1, 20),   // rankType = RLTOfficialRank
+                ...encodeField(2, 1),    // rangeType = RLRTTotal
             ]);
-            const respPromise = waitForMsg('cmsg.CRespRankList', 6000);
+            const resps = collectMsgs('cmsg.CRespRankList', 20000);
             window.__psc.Send(CMD, payload);
+            const pages = await resps;
+            for (const p of pages) {
+                for (const u of (p.payload?.rankList || [])) {
+                    if (u.userID) seen.add(String(u.userID));
+                }
+            }
+            return { ids: [...seen], pages: pages.length };
+        }, CMD_RANK_LIST, DELAY_MS);
+        officialRankIds = officialResult.ids;
+        console.log(`   ✅ 官阶榜 ${officialResult.pages} 页, ${officialRankIds.length} 人`);
+
+        // ── Step 1B：省级排位榜（2v2, modeID=8）─────────────────
+        console.log(`\n📊 Step 1B：省级排位榜（${PROVINCE_MAX + 1} 个省份, modeID=8）...`);
+        provinceRankedIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
+            const seen = new Set();
+            for (let pid = 0; pid <= provinceMax; pid++) {
+                const payload = new Uint8Array([
+                    ...encodeField(1, 5),    // rankType = 排位
+                    ...encodeField(2, 3),    // rangeType = 省级
+                    ...encodeField(3, 8),    // modeID = 欢乐竞技(2v2)
+                    ...encodeField(4, pid),
+                ]);
+                const respPromise = waitForMsg('cmsg.CRespRankList', 6000);
+                window.__psc.Send(CMD, payload);
+                try {
+                    const resp = await respPromise;
+                    for (const u of (resp.payload?.rankList || [])) {
+                        if (u.userID) seen.add(String(u.userID));
+                    }
+                } catch (_) {}
+                if (pid < provinceMax) await delay(delayMs);
+            }
+            return [...seen];
+        }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
+        console.log(`   ✅ 省级排位榜 ${provinceRankedIds.length} 人`);
+
+        // ── Step 1B2：省级身份排位榜（身份竞技, modeID=4）───────
+        console.log(`\n📊 Step 1B2：省级身份排位榜（${PROVINCE_MAX + 1} 个省份, modeID=4）...`);
+        provinceIdentityIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
+            const seen = new Set();
+            // 先查全服身份排位
+            const globalPayload = new Uint8Array([
+                ...encodeField(1, 5),    // rankType = 排位
+                ...encodeField(2, 1),    // rangeType = 全服
+                ...encodeField(3, 4),    // modeID = 身份竞技
+            ]);
+            const globalResp = waitForMsg('cmsg.CRespRankList', 10000);
+            window.__psc.Send(CMD, globalPayload);
             try {
-                const resp = await respPromise;
+                const resp = await globalResp;
                 for (const u of (resp.payload?.rankList || [])) {
                     if (u.userID) seen.add(String(u.userID));
                 }
             } catch (_) {}
-            if (pid < provinceMax) await delay(delayMs);
-        }
-        return [...seen];
-    }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
-    console.log(`   ✅ 省级榜 ${provinceIds.length} 人`);
+            await delay(delayMs);
 
-    // ── Step 1C：好友推荐"换一批" ───────────────────────────────
+            // 再逐省查询
+            for (let pid = 0; pid <= provinceMax; pid++) {
+                const payload = new Uint8Array([
+                    ...encodeField(1, 5),    // rankType = 排位
+                    ...encodeField(2, 3),    // rangeType = 省级
+                    ...encodeField(3, 4),    // modeID = 身份竞技
+                    ...encodeField(4, pid),
+                ]);
+                const respPromise = waitForMsg('cmsg.CRespRankList', 6000);
+                window.__psc.Send(CMD, payload);
+                try {
+                    const resp = await respPromise;
+                    for (const u of (resp.payload?.rankList || [])) {
+                        if (u.userID) seen.add(String(u.userID));
+                    }
+                } catch (_) {}
+                if (pid < provinceMax) await delay(delayMs);
+            }
+            return [...seen];
+        }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
+        console.log(`   ✅ 省级身份排位榜 ${provinceIdentityIds.length} 人`);
+
+        // ── 写入每日榜单缓存 ────────────────────────────────────
+        fs.mkdirSync(CACHE_DIR, { recursive: true });
+        fs.writeFileSync(cachePath, JSON.stringify({
+            date: todayStr,
+            createdAt: new Date().toISOString(),
+            officialRank:        { count: officialRankIds.length, ids: officialRankIds },
+            provincial:          { count: provinceRankedIds.length, ids: provinceRankedIds },
+            provincialIdentity:  { count: provinceIdentityIds.length, ids: provinceIdentityIds },
+        }, null, 2), 'utf8');
+        console.log(`\n💾 榜单缓存已保存：${cachePath}`);
+    }
+
+    // ── Step 1C：好友推荐"换一批"（始终执行）─────────────────────
     console.log(`\n📊 Step 1C：好友推荐（${FRIEND_ROUNDS} 轮 × ~20 人）...`);
     const friendIds = await page.evaluate(async (CMD, rounds, delayMs) => {
         const seen = new Set();
@@ -410,9 +482,9 @@ async function main() {
     console.log(`   ✅ 好友推荐 ${friendIds.length} 人`);
 
     // ── 合并去重 UserID ─────────────────────────────────────────
-    const allUserIdSet = new Set([...officialIds.ids, ...provinceIds, ...friendIds]);
+    const allUserIdSet = new Set([...officialRankIds, ...provinceRankedIds, ...provinceIdentityIds, ...friendIds]);
     const allUserIds = [...allUserIdSet];
-    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialIds.ids.length} + 省级${provinceIds.length} + 好友${friendIds.length})`);
+    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 好友${friendIds.length})`);
 
     // ── Step 2：查询 GameID ─────────────────────────────────────
     console.log(`\n🎮 Step 2：查询 ${allUserIds.length} 个玩家的对局记录...`);
@@ -433,9 +505,9 @@ async function main() {
                 const records = resp.payload?.recordData?.saveRecordList || [];
                 const gameIds = records
                     .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
-                    .map(r => String(r.gameID))
-                    .filter(g => g && g !== '0' && !seen.has(g));
-                for (const g of gameIds) seen.add(g);
+                    .map(r => ({ gameId: String(r.gameID), modeId: modeToInt(r.modeID) }))
+                    .filter(o => o.gameId && o.gameId !== '0' && !seen.has(o.gameId));
+                for (const o of gameIds) seen.add(o.gameId);
                 results.push({ userId: uid, gameIds });
             } catch (_) {
                 results.push({ userId: uid, gameIds: [] });
@@ -463,11 +535,13 @@ async function main() {
         metadata: {
             date:         today,
             time:         now.toISOString(),
+            batchId:      `${today}_${timeTag}`,
             account:      SGS_ACCOUNT,
             sources: {
-                officialRank: officialIds.ids.length,
-                provincial:   provinceIds.length,
-                friendRec:    friendIds.length,
+                officialRank:        officialRankIds.length,
+                provincial:          provinceRankedIds.length,
+                provincialIdentity:  provinceIdentityIds.length,
+                friendRec:           friendIds.length,
             },
             totalUserIds: allUserIds.length,
             totalGameIds: allGameIds.totalGameIds,

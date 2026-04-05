@@ -14,8 +14,11 @@ SGS 2v2 排位录像解析（mode=8，4人）
 
 用法:
   python pipeline/parse_2v2.py
-  python pipeline/parse_2v2.py --quiet     # 减少输出，适合大批量
+  python pipeline/parse_2v2.py --quiet          # 减少输出，适合大批量
+  python pipeline/parse_2v2.py --update-index   # 回写 parsed 到 index_ranked.json
 """
+
+import json
 
 import os
 import sys
@@ -50,10 +53,12 @@ HEADERS = [
 
 FLUSH_EVERY = 500
 
-ROOT       = Path(__file__).resolve().parent.parent
-INPUT_DIR  = ROOT / 'data' / 'replays' / '2v2'
-OUTPUT_DIR = ROOT / 'data' / 'output'
-OUT_PATH   = OUTPUT_DIR / 'parsed_2v2.csv'
+ROOT        = Path(__file__).resolve().parent.parent
+INPUT_DIR   = ROOT / 'data' / 'replays' / '2v2'
+OUTPUT_DIR  = ROOT / 'data' / 'output'
+OUT_PATH    = OUTPUT_DIR / 'parsed_2v2.csv'
+INDEXES_DIR = ROOT / 'data' / 'indexes'
+INDEX_FILE  = INDEXES_DIR / 'index_ranked.json'
 
 # ─────────────────── 座次 Pattern + Elo 提取 ───────────────────
 
@@ -147,6 +152,87 @@ def _rank_name(code):
     from common import rank_name
     return rank_name(code)
 
+# ─────────────────── 单场解析（用于 index 回写） ───────────────────
+
+def parse_single_game(sgs_path, mapping):
+    """解析单个 .sgs 文件，返回 parsed dict（用于嵌入 index JSON），解析失败返回 None。"""
+    try:
+        with open(sgs_path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return None
+
+    header = parse_header_only(raw)
+    if header is None or header['game_id'] is None:
+        return None
+    if header.get('mode_id') != MODE_ID:
+        return None
+
+    picks, candidates, results = parse_events(raw, header)
+    rows = build_rows(raw, header, picks, candidates, results, mapping)
+    if not rows:
+        return None
+
+    players = []
+    for r in rows:
+        players.append({
+            'seat':       int(r['座位']),
+            'name':       r['玩家昵称'],
+            'userId':     r['UserID'],
+            'rank':       r['官阶'],
+            'general':    r['选将'],
+            'camp':       r['阵营'],
+            'result':     r['胜负'],
+            'candidates': [c.strip() for c in r['出框武将'].split(',') if c.strip()] if r['出框武将'] else [],
+            'rankScore':  int(r['官阶积分']) if r['官阶积分'] else None,
+            'elo':        int(r['Elo']) if r['Elo'] else None,
+        })
+    return {'players': players}
+
+
+def update_index(quiet=False):
+    """从 index_ranked.json 中找 replayDownloaded=True 且 parsed=null 的 game，
+    解析对应 .sgs 文件，回写 parsed 字段。
+    """
+    if not INDEX_FILE.is_file():
+        print(f'❌ 索引文件不存在: {INDEX_FILE}')
+        return
+
+    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+        index_data = json.load(f)
+
+    mapping = load_mapping()
+    to_parse = [
+        (gid, entry) for gid, entry in index_data.get('games', {}).items()
+        if entry.get('replayDownloaded') and entry.get('parsed') is None
+    ]
+
+    if not to_parse:
+        print('ℹ️  没有需要解析的 2v2 录像')
+        return
+
+    print(f'📂 待解析: {len(to_parse)} 个 2v2 录像')
+    parsed_count = 0
+    failed_count = 0
+
+    for i, (gid, entry) in enumerate(to_parse, 1):
+        sgs_path = INPUT_DIR / f'{gid}.sgs'
+        result = parse_single_game(sgs_path, mapping)
+        if result:
+            entry['parsed'] = result
+            parsed_count += 1
+        else:
+            failed_count += 1
+
+        if not quiet and (i % 5000 == 0 or i == len(to_parse)):
+            print(f'  … {i}/{len(to_parse)} 已处理，成功 {parsed_count}')
+
+    with open(INDEX_FILE, 'w', encoding='utf-8') as f:
+        json.dump(index_data, f, ensure_ascii=False, indent=2)
+
+    print(f'✅ 索引更新: {parsed_count} 解析成功, {failed_count} 失败')
+
+
 # ─────────────────── 主流程 ───────────────────
 
 def process(quiet=False):
@@ -236,5 +322,9 @@ def process(quiet=False):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='解析 2v2 .sgs → CSV')
     ap.add_argument('--quiet', action='store_true', help='减少输出')
+    ap.add_argument('--update-index', action='store_true',
+                    help='回写 parsed 到 index_ranked.json')
     args = ap.parse_args()
     process(quiet=args.quiet)
+    if args.update_index:
+        update_index(quiet=args.quiet)

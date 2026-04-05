@@ -7,6 +7,14 @@ data/replays/
 # ── GameID 文件（可选：如不想公开采集来源则取消注释）
 # data/gameids/
 
+# ── Per-mode 索引（运行时生成，R2 同步）
+data/indexes/*
+!data/indexes/.gitkeep
+
+# ── 每日榜单缓存（运行时生成，R2 同步）
+data/cache/*
+!data/cache/.gitkeep
+
 # ── Python
 __pycache__/
 *.py[cod]

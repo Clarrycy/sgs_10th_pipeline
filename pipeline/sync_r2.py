@@ -18,6 +18,11 @@ R2 对象结构:
   output/index.csv
   output/parsed_2v2.csv
   output/parsed_doudizhu.csv
+  indexes/index_identity.json
+  indexes/index_ranked.json
+  indexes/index_doudizhu.json
+  indexes/session_state.json
+  cache/boards_YYYY-MM-DD.json
   replays/2v2/<GameID>.sgs      （--replays 时）
   replays/斗地主/<GameID>.sgs   （--replays 时）
 """
@@ -27,9 +32,11 @@ import sys
 import argparse
 from pathlib import Path
 
-ROOT       = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = ROOT / 'data' / 'output'
-REPLAY_DIR = ROOT / 'data' / 'replays'
+ROOT        = Path(__file__).resolve().parent.parent
+OUTPUT_DIR  = ROOT / 'data' / 'output'
+REPLAY_DIR  = ROOT / 'data' / 'replays'
+INDEXES_DIR = ROOT / 'data' / 'indexes'
+CACHE_DIR   = ROOT / 'data' / 'cache'
 
 # ─────────────────── 凭证 ───────────────────
 
@@ -78,6 +85,24 @@ def push(include_replays=False):
         key = f'output/{local.name}'
         _upload(client, bucket, local, key)
 
+    # 上传 data/indexes/
+    if INDEXES_DIR.is_dir():
+        idx_files = [f for f in INDEXES_DIR.glob('*.json') if f.is_file()]
+        if idx_files:
+            print(f'📤 上传 data/indexes/ ({len(idx_files)} 个文件)...')
+            for local in idx_files:
+                key = f'indexes/{local.name}'
+                _upload(client, bucket, local, key)
+
+    # 上传 data/cache/
+    if CACHE_DIR.is_dir():
+        cache_files = [f for f in CACHE_DIR.glob('*.json') if f.is_file()]
+        if cache_files:
+            print(f'📤 上传 data/cache/ ({len(cache_files)} 个文件)...')
+            for local in cache_files:
+                key = f'cache/{local.name}'
+                _upload(client, bucket, local, key)
+
     # 上传 data/replays/（可选）
     if include_replays:
         sgs_files = list(REPLAY_DIR.rglob('*.sgs'))
@@ -98,29 +123,44 @@ def _upload(client, bucket, local, key):
 
 # ─────────────────── 下载 ───────────────────
 
-def pull():
-    client, bucket = get_client()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    print('📥 从 R2 拉取 output/...')
+def _pull_prefix(client, bucket, prefix, local_dir):
+    """从 R2 拉取指定前缀的所有文件到本地目录。返回拉取文件数。"""
+    local_dir.mkdir(parents=True, exist_ok=True)
     paginator = client.get_paginator('list_objects_v2')
     count = 0
-    for page in paginator.paginate(Bucket=bucket, Prefix='output/'):
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get('Contents', []):
             key  = obj['Key']
             name = Path(key).name
             if not name:
                 continue
-            local = OUTPUT_DIR / name
+            local = local_dir / name
             print(f'  ↓ {key}', end=' ', flush=True)
             client.download_file(bucket, key, str(local))
             print('✓')
             count += 1
+    return count
 
-    if count == 0:
-        print('  （R2 上没有找到 output/ 文件，首次运行正常）')
+
+def pull():
+    client, bucket = get_client()
+
+    total = 0
+    for prefix, local_dir, label in [
+        ('output/',  OUTPUT_DIR,  'output'),
+        ('indexes/', INDEXES_DIR, 'indexes'),
+        ('cache/',   CACHE_DIR,   'cache'),
+    ]:
+        print(f'📥 从 R2 拉取 {label}/...')
+        count = _pull_prefix(client, bucket, prefix, local_dir)
+        if count == 0:
+            print(f'  （R2 上没有 {label}/ 文件）')
+        total += count
+
+    if total > 0:
+        print(f'✅ 拉取完成（共 {total} 个文件）')
     else:
-        print(f'✅ 拉取完成（{count} 个文件）')
+        print('  （首次运行，R2 上没有已有数据）')
 
 # ─────────────────── 列表 ───────────────────
 

@@ -11,8 +11,10 @@ SGS 斗地主录像解析（mode=36，3人）
 用法:
   python pipeline/parse_doudizhu.py
   python pipeline/parse_doudizhu.py --quiet
+  python pipeline/parse_doudizhu.py --update-index  # 回写 parsed 到 index_doudizhu.json
 """
 
+import json
 import sys
 import csv
 import argparse
@@ -37,10 +39,12 @@ HEADERS = [
 
 FLUSH_EVERY = 500
 
-ROOT       = Path(__file__).resolve().parent.parent
-INPUT_DIR  = ROOT / 'data' / 'replays' / '斗地主'
-OUTPUT_DIR = ROOT / 'data' / 'output'
-OUT_PATH   = OUTPUT_DIR / 'parsed_doudizhu.csv'
+ROOT        = Path(__file__).resolve().parent.parent
+INPUT_DIR   = ROOT / 'data' / 'replays' / '斗地主'
+OUTPUT_DIR  = ROOT / 'data' / 'output'
+OUT_PATH    = OUTPUT_DIR / 'parsed_doudizhu.csv'
+INDEXES_DIR = ROOT / 'data' / 'indexes'
+INDEX_FILE  = INDEXES_DIR / 'index_doudizhu.json'
 
 # ─────────────────── 构建行 ───────────────────
 
@@ -81,6 +85,93 @@ def build_rows(header, picks, candidates, results, mapping, landlord_seat, swaps
 def _rank_name(code):
     from common import rank_name
     return rank_name(code)
+
+# ─────────────────── 单场解析（用于 index 回写） ───────────────────
+
+def parse_single_game(sgs_path, mapping):
+    """解析单个 .sgs 文件，返回 parsed dict（用于嵌入 index JSON），解析失败返回 None。"""
+    try:
+        with open(sgs_path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return None
+
+    header = parse_header_only(data)
+    if header is None or header['game_id'] is None:
+        return None
+    if header.get('mode_id') != MODE_ID:
+        return None
+
+    picks, candidates, results = parse_events(data, header)
+    swaps    = parse_swaps(data)
+    landlord = parse_landlord_seat(data)
+    if landlord is None:
+        landlord = 0
+
+    rows = build_rows(header, picks, candidates, results, mapping, landlord, swaps)
+    if not rows:
+        return None
+
+    players = []
+    for r in rows:
+        players.append({
+            'seat':       int(r['座位']),
+            'name':       r['玩家昵称'],
+            'userId':     r['UserID'],
+            'rank':       r['官阶'],
+            'generalId':  int(r['选将ID']) if r['选将ID'] else None,
+            'general':    r['选将'],
+            'camp':       r['阵营'],
+            'result':     r['胜负'],
+            'candidates': [c.strip() for c in r['初始出框'].split(',') if c.strip()] if r['初始出框'] else [],
+            'swapsOut':   [c.strip() for c in r['换走'].split(',') if c.strip()] if r['换走'] else [],
+            'swapsIn':    [c.strip() for c in r['换入'].split(',') if c.strip()] if r['换入'] else [],
+        })
+    return {'players': players}
+
+
+def update_index(quiet=False):
+    """从 index_doudizhu.json 中找 replayDownloaded=True 且 parsed=null 的 game，
+    解析对应 .sgs 文件，回写 parsed 字段。
+    """
+    if not INDEX_FILE.is_file():
+        print(f'❌ 索引文件不存在: {INDEX_FILE}')
+        return
+
+    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+        index_data = json.load(f)
+
+    mapping = load_mapping()
+    to_parse = [
+        (gid, entry) for gid, entry in index_data.get('games', {}).items()
+        if entry.get('replayDownloaded') and entry.get('parsed') is None
+    ]
+
+    if not to_parse:
+        print('ℹ️  没有需要解析的斗地主录像')
+        return
+
+    print(f'📂 待解析: {len(to_parse)} 个斗地主录像')
+    parsed_count = 0
+    failed_count = 0
+
+    for i, (gid, entry) in enumerate(to_parse, 1):
+        sgs_path = INPUT_DIR / f'{gid}.sgs'
+        result = parse_single_game(sgs_path, mapping)
+        if result:
+            entry['parsed'] = result
+            parsed_count += 1
+        else:
+            failed_count += 1
+
+        if not quiet and (i % 3000 == 0 or i == len(to_parse)):
+            print(f'  … {i}/{len(to_parse)} 已处理，成功 {parsed_count}')
+
+    with open(INDEX_FILE, 'w', encoding='utf-8') as f:
+        json.dump(index_data, f, ensure_ascii=False, indent=2)
+
+    print(f'✅ 索引更新: {parsed_count} 解析成功, {failed_count} 失败')
+
 
 # ─────────────────── 主流程 ───────────────────
 
@@ -181,5 +272,9 @@ def process(quiet=False):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='解析斗地主 .sgs → CSV')
     ap.add_argument('--quiet', action='store_true', help='减少输出，适合大批量')
+    ap.add_argument('--update-index', action='store_true',
+                    help='回写 parsed 到 index_doudizhu.json')
     args = ap.parse_args()
     process(quiet=args.quiet)
+    if args.update_index:
+        update_index(quiet=args.quiet)
