@@ -176,11 +176,20 @@ async function main() {
             } catch (_) {}
         };
 
-        // 用 Object.defineProperty 锁住 console.log，游戏加载后再赋值也无法覆盖
+        // 锁住 console.log，防止游戏覆盖
         Object.defineProperty(console, 'log', {
             get: () => _hook,
-            set: () => {},   // 静默忽略游戏的覆盖尝试
-            configurable: true,  // 允许后续 evaluateOnNewDocument 重新定义
+            set: () => {},
+            configurable: true,
+        });
+
+        // 游戏会替换整个 window.console 对象（基础款靠 iframe 恢复 console 就是这个原因）
+        // 锁住 window.console，防止整个对象被替换
+        const _console = console;
+        Object.defineProperty(window, 'console', {
+            get: () => _console,
+            set: () => {},
+            configurable: true,
         });
     });
 
