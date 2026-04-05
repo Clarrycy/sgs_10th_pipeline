@@ -7,6 +7,7 @@
     "save-cookies": "node collect/save_cookies.js"
   },
   "dependencies": {
+    "proxy-agent": "^6.4.0",
     "puppeteer": "^24.0.0"
   }
 }
