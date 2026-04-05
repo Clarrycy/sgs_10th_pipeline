@@ -23,6 +23,7 @@ R2 对象结构:
   indexes/index_doudizhu.json
   indexes/session_state.json
   cache/boards_YYYY-MM-DD.json
+  gameids/YYYY-MM-DD_HHMM.json
   replays/2v2/<GameID>.sgs      （--replays 时）
   replays/斗地主/<GameID>.sgs   （--replays 时）
 """
@@ -37,6 +38,7 @@ OUTPUT_DIR  = ROOT / 'data' / 'output'
 REPLAY_DIR  = ROOT / 'data' / 'replays'
 INDEXES_DIR = ROOT / 'data' / 'indexes'
 CACHE_DIR   = ROOT / 'data' / 'cache'
+GAMEID_DIR  = ROOT / 'data' / 'gameids'
 
 # ─────────────────── 凭证 ───────────────────
 
@@ -103,6 +105,15 @@ def push(include_replays=False):
                 key = f'cache/{local.name}'
                 _upload(client, bucket, local, key)
 
+    # 上传 data/gameids/（保留 batch 原始数据）
+    if GAMEID_DIR.is_dir():
+        gid_files = [f for f in GAMEID_DIR.glob('*.json') if f.is_file()]
+        if gid_files:
+            print(f'📤 上传 data/gameids/ ({len(gid_files)} 个文件)...')
+            for local in gid_files:
+                key = f'gameids/{local.name}'
+                _upload(client, bucket, local, key)
+
     # 上传 data/replays/（可选）
     if include_replays:
         sgs_files = list(REPLAY_DIR.rglob('*.sgs'))
@@ -150,6 +161,7 @@ def pull():
         ('output/',  OUTPUT_DIR,  'output'),
         ('indexes/', INDEXES_DIR, 'indexes'),
         ('cache/',   CACHE_DIR,   'cache'),
+        ('gameids/', GAMEID_DIR,  'gameids'),
     ]:
         print(f'📥 从 R2 拉取 {label}/...')
         count = _pull_prefix(client, bucket, prefix, local_dir)

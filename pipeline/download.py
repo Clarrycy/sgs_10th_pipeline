@@ -149,13 +149,26 @@ class IndexWriter:
 
 # ─────────────────── GameID 加载 ───────────────────
 
+def _extract_gameid(item):
+    """从 gameIds 数组的元素中提取 GameID 字符串。
+    支持两种格式：
+      - 纯字符串/数字: "123456" → "123456"
+      - 对象: {"gameId": "123456", "modeId": 8} → "123456"
+    """
+    if isinstance(item, dict):
+        return str(item.get('gameId', ''))
+    return str(item)
+
+
 def load_all_gameids(source_tag_out=None):
     """
     扫描 data/gameids/*.json，合并所有 GameID。
     支持格式：
+      - {"metadata": ..., "results": [{"userId": ..., "gameIds": [...]}]}  ← collect.js 输出
       - {"uniqueGameIds": [...]}
       - [{"userId": ..., "gameIds": [...]}, ...]
       - ["gid1", "gid2", ...]
+    gameIds 元素可以是字符串或 {gameId, modeId} 对象。
     返回 list[str]（已去重，保留顺序）。
     """
     json_files = sorted(GAMEID_DIR.glob('*.json'))
@@ -172,18 +185,28 @@ def load_all_gameids(source_tag_out=None):
             data = json.load(f)
 
         ids_from_file = []
-        if isinstance(data, dict) and 'uniqueGameIds' in data:
-            ids_from_file = data['uniqueGameIds']
+
+        if isinstance(data, dict) and 'results' in data:
+            # collect.js 标准输出格式: {metadata, results: [{userId, gameIds}, ...]}
+            for entry in data['results']:
+                for item in entry.get('gameIds', []):
+                    gid = _extract_gameid(item)
+                    if gid:
+                        ids_from_file.append(gid)
+        elif isinstance(data, dict) and 'uniqueGameIds' in data:
+            ids_from_file = [str(g) for g in data['uniqueGameIds']]
         elif isinstance(data, list) and data and isinstance(data[0], dict):
             for entry in data:
-                ids_from_file.extend(entry.get('gameIds', []))
+                for item in entry.get('gameIds', []):
+                    gid = _extract_gameid(item)
+                    if gid:
+                        ids_from_file.append(gid)
         elif isinstance(data, list):
-            ids_from_file = data
+            ids_from_file = [str(g) for g in data]
 
         before = len(result)
         for gid in ids_from_file:
-            gid = str(gid)
-            if gid not in seen:
+            if gid and gid != '0' and gid not in seen:
                 seen.add(gid)
                 result.append(gid)
         sources.append(f'{jf.name}(+{len(result)-before})')
