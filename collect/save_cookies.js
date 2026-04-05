@@ -16,13 +16,16 @@
  * 注意：cookies.json 已加入 .gitignore，不要手动提交它。
  */
 
-const puppeteer = require('puppeteer');
-const fs        = require('fs');
-const path      = require('path');
-const readline  = require('readline');
+const puppeteer     = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
-const GAME_URL   = 'https://web.sanguosha.com/10/';
-const OUT_PATH   = path.resolve(__dirname, '..', 'cookies.json');
+const fs       = require('fs');
+const path     = require('path');
+const readline = require('readline');
+
+const LOGIN_URL = 'https://web.sanguosha.com/login/index.html';
+const OUT_PATH  = path.resolve(__dirname, '..', 'cookies.json');
 
 async function main() {
     console.log('🌐 打开浏览器，请手动完成登录...');
@@ -33,7 +36,7 @@ async function main() {
     });
 
     const page = await browser.newPage();
-    await page.goto(GAME_URL, { waitUntil: 'domcontentloaded' });
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
 
     console.log('');
     console.log('👆 请在弹出的浏览器里完成登录，进入游戏主界面。');

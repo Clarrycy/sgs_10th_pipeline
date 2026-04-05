@@ -20,12 +20,16 @@
  *   node collect/collect.js
  */
 
-const puppeteer = require('puppeteer');
-const fs        = require('fs');
-const path      = require('path');
+const puppeteer     = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
+
+const fs   = require('fs');
+const path = require('path');
 
 // ─────────────────── 配置 ───────────────────
 
+const LOGIN_URL    = 'https://web.sanguosha.com/login/index.html';
 const GAME_URL     = 'https://web.sanguosha.com/10/';
 const KEEP_MODES   = (process.env.KEEP_MODES || '8,36').split(',').map(Number);
 const PROVINCE_MAX = parseInt(process.env.PROVINCE_MAX || '33', 10);
@@ -52,7 +56,8 @@ async function main() {
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',  // GitHub Actions 环境必须
+            '--disable-dev-shm-usage',       // GitHub Actions 必须
+            '--disable-blink-features=AutomationControlled',
         ],
     });
 
@@ -101,9 +106,21 @@ async function main() {
         process.exit(1);
     }
 
-    // ── 加载游戏 ─────────────────────────────────────────────────
+    // ── 加载游戏（先去登录页，Cookie 有效则自动跳转到游戏） ─────────
     console.log('🌐 加载游戏页面...');
-    await page.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // 等待跳转到游戏主页（最多 20 秒）
+    await page.waitForFunction(
+        (gameUrl) => window.location.href.startsWith(gameUrl),
+        { timeout: 20000 },
+        GAME_URL,
+    ).catch(async () => {
+        // 没跳转说明 Cookie 失效，仍在登录页
+        console.error('❌ Cookie 已失效，未能自动跳转到游戏页面');
+        console.error('   请重新运行 node collect/save_cookies.js 更新 Cookie');
+        await browser.close();
+        process.exit(1);
+    });
 
     // ── 等待鉴权完成（CRespAuth 或 CRespLogin 收到 userID） ──────
     console.log('⏳ 等待游戏认证...');
