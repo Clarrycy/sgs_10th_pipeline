@@ -202,7 +202,7 @@ async function main() {
 
     // ── 登录 ────────────────────────────────────────────────────
     console.log('🌐 打开登录页...');
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     console.log('✏️  填写账号密码...');
     await page.waitForSelector('#SGS_login-account', { timeout: 10000 });
@@ -217,7 +217,7 @@ async function main() {
 
     // ── 游戏选择 ────────────────────────────────────────────────
     console.log('🎮 等待游戏选择界面...');
-    await page.waitForSelector('#selectGame', { visible: true, timeout: 30000 }).catch(async () => {
+    await page.waitForSelector('#selectGame', { visible: true, timeout: 60000 }).catch(async () => {
         console.error('❌ 登录失败');
         await browser.close();
         process.exit(1);
@@ -232,7 +232,7 @@ async function main() {
 
     console.log('⏳ 点击进入游戏...');
     await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
         page.click('#goInGameBtn'),
     ]).catch(async () => {
         console.log('   导航未触发，检查 URL...');
