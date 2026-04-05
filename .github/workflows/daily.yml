@@ -2,7 +2,9 @@ name: Daily Pipeline
 
 on:
   schedule:
-    - cron: '0 18 * * *'   # 每天 UTC 18:00 = 北京时间次日 02:00
+    # 每 2 小时跑一次（公开仓库不限分钟数）
+    # 两个账号按小时轮替：偶数小时用账号1，奇数小时用账号2
+    - cron: '0 */2 * * *'
   workflow_dispatch:        # 支持手动触发
 
 jobs:
@@ -42,13 +44,15 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python pipeline/sync_r2.py --pull
 
-      # ── Puppeteer 全自动采集：排行榜 UserID → GameID
+      # ── Puppeteer 采集：官阶榜 + 省级榜 + 好友推荐 → GameID
       - name: Collect GameIDs
         env:
-          GAME_COOKIES: ${{ secrets.GAME_COOKIES }}
-          KEEP_MODES:   '8,36'
-          PROVINCE_MAX: '33'
-          REQUEST_DELAY: '350'
+          SGS_ACCOUNTS:   ${{ secrets.SGS_ACCOUNTS }}
+          SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS }}
+          KEEP_MODES:     '8,36'
+          PROVINCE_MAX:   '33'
+          FRIEND_ROUNDS:  '100'
+          REQUEST_DELAY:  '300'
         run: node collect/collect.js
 
       # ── 下载录像（只取最近 7 天，与服务器保留期一致）

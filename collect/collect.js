@@ -4,20 +4,22 @@
 /**
  * SGS 全自动采集脚本  collect/collect.js
  *
- * 流程：
- *   1. 无头浏览器加载游戏（用已保存的 Cookie 免登录）
- *   2. 向服务器主动发送排行榜请求（所有省份），收集 UserID
- *   3. 逐个查询每个 UserID 的对局记录，提取 GameID
- *   4. 按模式过滤，输出到 data/gameids/YYYY-MM-DD.json
+ * 采集源：
+ *   A. 官阶榜 top 500（rankType=20, 自动分页 5×100）
+ *   B. 省级排位榜 34 省 × top 100（rankType=5）
+ *   C. 好友推荐"换一批"（CReqFriendRecommend, ~20 人/次, 刷 N 轮）
+ *   → 所有去重 UserID 查战绩 → GameID
  *
  * 环境变量：
- *   GAME_COOKIES   游戏 Cookie JSON（见 save_cookies.js 如何导出）
- *   KEEP_MODES     保留的模式 ID，逗号分隔（默认 "8,36"）
- *   PROVINCE_MAX   最大省份 ID（默认 33，即 0-33 共 34 个省）
- *   REQUEST_DELAY  请求间隔 ms（默认 300）
+ *   SGS_ACCOUNTS    登录账号（逗号分隔，按小时轮替）
+ *   SGS_PASSWORDS   登录密码（逗号分隔，与账号一一对应）
+ *   KEEP_MODES      保留的模式 ID（默认 "8,36"）
+ *   PROVINCE_MAX    最大省份 ID（默认 33）
+ *   FRIEND_ROUNDS   好友推荐刷新轮数（默认 100，约 2000 人）
+ *   REQUEST_DELAY   请求间隔 ms（默认 300）
  *
  * 用法：
- *   node collect/collect.js
+ *   SGS_ACCOUNTS=a1,a2 SGS_PASSWORDS=p1,p2 node collect/collect.js
  */
 
 const puppeteer = require('puppeteer');
@@ -26,69 +28,135 @@ const path      = require('path');
 
 // ─────────────────── 配置 ───────────────────
 
-const LOGIN_URL    = 'https://web.sanguosha.com/login/index.html';
-const GAME_URL     = 'https://web.sanguosha.com/10/';
-const KEEP_MODES   = (process.env.KEEP_MODES || '8,36').split(',').map(Number);
-const PROVINCE_MAX = parseInt(process.env.PROVINCE_MAX || '33', 10);
-const DELAY_MS     = parseInt(process.env.REQUEST_DELAY || '300', 10);
+const LOGIN_URL      = 'https://web.sanguosha.com/login/index.html';
+const GAME_URL       = 'https://web.sanguosha.com/10/';
+const KEEP_MODES     = (process.env.KEEP_MODES || '8,36').split(',').map(Number);
+const PROVINCE_MAX   = parseInt(process.env.PROVINCE_MAX || '33', 10);
+const FRIEND_ROUNDS  = parseInt(process.env.FRIEND_ROUNDS || '100', 10);
+const DELAY_MS       = parseInt(process.env.REQUEST_DELAY || '300', 10);
 
-const ROOT       = path.resolve(__dirname, '..');
+const ROOT        = path.resolve(__dirname, '..');
 const GAMEIDS_DIR = path.join(ROOT, 'data', 'gameids');
+
+// ─────────────────── cmdId 常量 ───────────────────
+
+const CMD_RANK_LIST          = 3611896190;  // CReqRankList
+const CMD_FRIEND_RECOMMEND   = 2818936274;  // CReqFriendRecommend（空 payload）
+const CMD_GET_GAME_RECORD    = 1065628532;  // CReqGetNewGameRecord
 
 // ─────────────────── 主流程 ───────────────────
 
 async function main() {
     fs.mkdirSync(GAMEIDS_DIR, { recursive: true });
 
-    const cookiesJson = process.env.GAME_COOKIES;
-    if (!cookiesJson) {
-        console.error('❌ 缺少环境变量 GAME_COOKIES');
-        console.error('   请先运行 node collect/save_cookies.js 导出 Cookie');
+    const accounts  = (process.env.SGS_ACCOUNTS  || '').split(',').filter(Boolean);
+    const passwords = (process.env.SGS_PASSWORDS || '').split(',').filter(Boolean);
+    if (!accounts.length || accounts.length !== passwords.length) {
+        console.error('❌ 缺少环境变量 SGS_ACCOUNTS / SGS_PASSWORDS（逗号分隔，数量需一致）');
         process.exit(1);
     }
+    // 按当前小时轮替账号
+    const hour = new Date().getUTCHours();
+    const idx = hour % accounts.length;
+    const SGS_ACCOUNT  = accounts[idx];
+    const SGS_PASSWORD = passwords[idx];
+    console.log(`📋 使用账号 ${idx + 1}/${accounts.length}: ${SGS_ACCOUNT}  (UTC hour=${hour})`);
 
+    // ── 启动浏览器 ──────────────────────────────────────────────
     console.log('🚀 启动无头浏览器...');
     const browser = await puppeteer.launch({
         headless: 'new',
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',       // GitHub Actions 必须
+            '--disable-dev-shm-usage',
             '--disable-blink-features=AutomationControlled',
+            '--incognito',
+            '--use-fake-ui-for-media-stream',
+            '--use-fake-device-for-media-stream',
         ],
     });
 
-    const page = await browser.newPage();
-    page.setDefaultTimeout(0);  // 禁用全局超时，长任务需要
+    const ctx = await browser.createBrowserContext();
+    await ctx.overridePermissions('https://web.sanguosha.com', []);
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(0);
+    page.on('dialog', async dialog => { await dialog.dismiss(); });
 
-    // ── 反自动化检测（手动实现，不依赖第三方插件） ───────────────
+    // ── 反检测 ──────────────────────────────────────────────────
     await page.setUserAgent(
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
         '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
     );
     await page.evaluateOnNewDocument(() => {
-        // 隐藏 webdriver 标记
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        // 伪造插件列表（无头浏览器通常为空）
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-        // 伪造语言
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
     });
 
-    // ── 注入 console.log 拦截（必须在页面加载前） ────────────────
+    // ── 注入采集工具函数 ──────────────────────────────────────────
     await page.evaluateOnNewDocument(() => {
-        // 用 iframe 恢复原始 console，防止游戏覆盖
+        window.__utils = true;  // 标记已注入
+
+        window.encodeVarint = function(v) {
+            let val = BigInt(v), bytes = [];
+            while (val > 127n) { bytes.push(Number(val & 0x7Fn) | 0x80); val >>= 7n; }
+            bytes.push(Number(val));
+            return bytes;
+        };
+        window.encodeField = function(f, v) { return [(f << 3) | 0, ...encodeVarint(v)]; };
+
+        window.waitForMsg = function(name, timeoutMs) {
+            timeoutMs = timeoutMs || 8000;
+            return new Promise((resolve, reject) => {
+                const t = setTimeout(() => reject(new Error('timeout:' + name)), timeoutMs);
+                const cap = window.__cap;
+                cap.hooks[name] = cap.hooks[name] || [];
+                cap.hooks[name].push(m => { clearTimeout(t); resolve(m); });
+            });
+        };
+
+        // 收集多个同名响应（官阶榜自动分页 5×100）
+        window.collectMsgs = function(name, timeoutMs) {
+            timeoutMs = timeoutMs || 20000;
+            return new Promise(resolve => {
+                const results = [];
+                let timer = null;
+                const cap = window.__cap;
+                const deadline = setTimeout(() => resolve(results), timeoutMs);
+                function resetTimer() {
+                    if (timer) clearTimeout(timer);
+                    timer = setTimeout(() => { clearTimeout(deadline); resolve(results); }, 3000);
+                }
+                cap.hooks[name] = cap.hooks[name] || [];
+                function handler(m) {
+                    results.push(m);
+                    if (m.payload?.isFinish) {
+                        clearTimeout(deadline);
+                        if (timer) clearTimeout(timer);
+                        resolve(results);
+                    } else {
+                        resetTimer();
+                        cap.hooks[name].push(handler);
+                    }
+                }
+                cap.hooks[name].push(handler);
+                resetTimer();
+            });
+        };
+
+        const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4 };
+        window.modeToInt = function(m) { return typeof m === 'string' ? (MODE_STR[m] || 0) : (m || 0); };
+        window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
+    });
+
+    // ── console.log 拦截 ────────────────────────────────────────
+    await page.evaluateOnNewDocument(() => {
         const _iframe = document.createElement('iframe');
         _iframe.style.display = 'none';
         document.head.appendChild(_iframe);
         const _nativeLog = _iframe.contentWindow.console.log;
-
-        // 消息捕获中心
-        window.__cap = {
-            msgs:  [],                  // 所有收到的消息
-            hooks: {},                  // {msgName: [resolve]}  一次性等待钩子
-        };
-
+        window.__cap = { msgs: [], hooks: {} };
         const _orig = console.log;
         console.log = function (...args) {
             _orig.apply(console, args);
@@ -106,34 +174,92 @@ async function main() {
         };
     });
 
-    // ── 加载 Cookie，跳过登录 ────────────────────────────────────
-    try {
-        const cookies = JSON.parse(cookiesJson);
-        await page.setCookie(...cookies);
-        console.log(`🍪 已加载 ${cookies.length} 个 Cookie`);
-    } catch (e) {
-        console.error('❌ Cookie 解析失败：', e.message);
-        await browser.close();
-        process.exit(1);
-    }
-
-    // ── 加载游戏（先去登录页，Cookie 有效则自动跳转到游戏） ─────────
-    console.log('🌐 加载游戏页面...');
+    // ── 登录 ────────────────────────────────────────────────────
+    console.log('🌐 打开登录页...');
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    // 等待跳转到游戏主页（最多 20 秒）
-    await page.waitForFunction(
-        (gameUrl) => window.location.href.startsWith(gameUrl),
-        { timeout: 20000 },
-        GAME_URL,
-    ).catch(async () => {
-        // 没跳转说明 Cookie 失效，仍在登录页
-        console.error('❌ Cookie 已失效，未能自动跳转到游戏页面');
-        console.error('   请重新运行 node collect/save_cookies.js 更新 Cookie');
+
+    console.log('✏️  填写账号密码...');
+    await page.waitForSelector('#SGS_login-account', { timeout: 10000 });
+    await page.type('#SGS_login-account', SGS_ACCOUNT, { delay: 50 });
+    await page.type('#SGS_login-password', SGS_PASSWORD, { delay: 50 });
+
+    const agreed = await page.$eval('#SGS_userProto', el => el.checked);
+    if (!agreed) await page.click('#SGS_userProto');
+
+    console.log('🔑 点击登录...');
+    await page.click('#SGS_login-btn');
+
+    // ── 游戏选择 ────────────────────────────────────────────────
+    console.log('🎮 等待游戏选择界面...');
+    await page.waitForSelector('#selectGame', { visible: true, timeout: 30000 }).catch(async () => {
+        console.error('❌ 登录失败');
         await browser.close();
         process.exit(1);
     });
 
-    // ── 等待鉴权完成（CRespAuth 或 CRespLogin 收到 userID） ──────
+    console.log('🎮 选择三国杀：一将成名...');
+    await page.evaluate(() => {
+        const items = document.querySelectorAll('#oL10th .game-item');
+        if (items.length >= 3) items[2].click();
+    });
+    await new Promise(r => setTimeout(r, 500));
+
+    console.log('⏳ 点击进入游戏...');
+    await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+        page.click('#goInGameBtn'),
+    ]).catch(async () => {
+        console.log('   导航未触发，检查 URL...');
+        await new Promise(r => setTimeout(r, 5000));
+    });
+    if (!page.url().startsWith(GAME_URL)) {
+        await page.evaluate(() => {
+            const el = document.querySelector('#goInGameBtn');
+            if (el) el.click();
+        });
+        await page.waitForFunction(
+            (u) => window.location.href.startsWith(u), { timeout: 15000 }, GAME_URL,
+        ).catch(async () => {
+            console.error('❌ 无法进入游戏页面');
+            await browser.close();
+            process.exit(1);
+        });
+    }
+
+    // ── 处理 Laya 弹窗（canvas 坐标点击"开启"） ─────────────────
+    console.log('🔇 处理游戏内弹窗...');
+    await page.waitForFunction(() => typeof Laya !== 'undefined' && Laya.stage, { timeout: 30000 });
+    await new Promise(r => setTimeout(r, 5000));
+
+    await page.evaluate(() => {
+        const canvas = document.querySelector('canvas');
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        // 图层 800x450 左下角原点, "开启" at (340, 150) → 左上角 (340, 300)
+        const clientX = rect.left + (340 / 800) * rect.width;
+        const clientY = rect.top + (300 / 450) * rect.height;
+        for (const type of ['mousedown', 'mouseup', 'click']) {
+            canvas.dispatchEvent(new MouseEvent(type, {
+                clientX, clientY, bubbles: true, cancelable: true, button: 0
+            }));
+        }
+    });
+    await new Promise(r => setTimeout(r, 2000));
+    // 再点一次
+    await page.evaluate(() => {
+        const canvas = document.querySelector('canvas');
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const clientX = rect.left + (340 / 800) * rect.width;
+        const clientY = rect.top + (300 / 450) * rect.height;
+        for (const type of ['mousedown', 'mouseup', 'click']) {
+            canvas.dispatchEvent(new MouseEvent(type, {
+                clientX, clientY, bubbles: true, cancelable: true, button: 0
+            }));
+        }
+    });
+
+    // ── 等待认证 ────────────────────────────────────────────────
     console.log('⏳ 等待游戏认证...');
     try {
         await page.waitForFunction(() => {
@@ -144,16 +270,15 @@ async function main() {
             );
         }, { timeout: 60000 });
     } catch (_) {
-        console.error('❌ 认证超时，Cookie 可能已过期。请重新运行 save_cookies.js');
+        console.error('❌ 认证超时');
         await browser.close();
         process.exit(1);
     }
     console.log('✅ 认证成功');
 
-    // ── 等待 PSC 可用 ────────────────────────────────────────────
+    // ── 等待 PSC ────────────────────────────────────────────────
     await page.evaluate(() => {
         return new Promise((resolve, reject) => {
-            const deadline = Date.now() + 15000;
             const origSend = Laya.Socket.prototype.send;
             Laya.Socket.prototype.send = function (data) {
                 if (!window.__psc) {
@@ -169,100 +294,105 @@ async function main() {
                 }
                 return origSend.apply(this, arguments);
             };
-            // 如果 PSC 已存在（重复调用时）
             if (window.__psc) resolve();
             setTimeout(() => reject(new Error('PSC timeout')), 15000);
         });
     });
     console.log('✅ PSC 就绪');
 
-    // ── Step 1：采集 UserID（向所有省份发排行榜请求） ────────────
-    console.log(`\n📊 Step 1：采集排行榜 UserID（${PROVINCE_MAX + 1} 个省份）...`);
-    const userIds = await page.evaluate(async (provinceMax, delayMs) => {
-        function encodeVarint(v) {
-            let val = BigInt(v), bytes = [];
-            while (val > 127n) { bytes.push(Number(val & 0x7Fn) | 0x80); val >>= 7n; }
-            bytes.push(Number(val));
-            return bytes;
-        }
-        function encodeField(f, v) { return [(f << 3) | 0, ...encodeVarint(v)]; }
+    // ════════════════════════════════════════════════════════════
+    //  采集阶段
+    // ════════════════════════════════════════════════════════════
 
-        function waitForMsg(name, timeoutMs = 5000) {
-            return new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error(`timeout:${name}`)), timeoutMs);
-                const cap = window.__cap;
-                cap.hooks[name] = cap.hooks[name] || [];
-                cap.hooks[name].push(m => { clearTimeout(t); resolve(m); });
-            });
-        }
-
+    // ── Step 1A：官阶榜 top 500 ─────────────────────────────────
+    console.log('\n📊 Step 1A：官阶榜 top 500...');
+    const officialIds = await page.evaluate(async (CMD, delayMs) => {
         const seen = new Set();
+        // rankType=20(官阶), rangeType=1(全服), modeID=0, provinceID=-1
+        // provinceID=-1 需要用有符号编码：用 zigzag? 不，protobuf3 varint 是无符号的
+        // 但录像中 provinceID=-1 能工作，可能服务端忽略了这个字段
+        // 安全起见不传 provinceID（protobuf3 零值省略）
+        const payload = new Uint8Array([
+            ...encodeField(1, 20),   // rankType = RLTOfficialRank
+            ...encodeField(2, 1),    // rangeType = RLRTTotal
+        ]);
+        const resps = collectMsgs('cmsg.CRespRankList', 20000);
+        window.__psc.Send(CMD, payload);
+        const pages = await resps;
+        for (const p of pages) {
+            for (const u of (p.payload?.rankList || [])) {
+                if (u.userID) seen.add(String(u.userID));
+            }
+        }
+        return { ids: [...seen], pages: pages.length };
+    }, CMD_RANK_LIST, DELAY_MS);
+    console.log(`   ✅ 官阶榜 ${officialIds.pages} 页, ${officialIds.ids.length} 人`);
 
-        // CReqRankList: cmdId=3611896190
-        // field1=rankType=5, field2=rangeType=3, field3=modeID=8, field4=provinceID=N
+    // ── Step 1B：省级排位榜 ─────────────────────────────────────
+    console.log(`\n📊 Step 1B：省级排位榜（${PROVINCE_MAX + 1} 个省份）...`);
+    const provinceIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
+        const seen = new Set();
         for (let pid = 0; pid <= provinceMax; pid++) {
             const payload = new Uint8Array([
-                ...encodeField(1, 5),    // rankType
-                ...encodeField(2, 3),    // rangeType (省级)
-                ...encodeField(3, 8),    // modeID (欢乐竞技)
-                ...encodeField(4, pid),  // provinceID
+                ...encodeField(1, 5),    // rankType = 排位
+                ...encodeField(2, 3),    // rangeType = 省级
+                ...encodeField(3, 8),    // modeID = 欢乐竞技
+                ...encodeField(4, pid),
             ]);
-
             const respPromise = waitForMsg('cmsg.CRespRankList', 6000);
-            window.__psc.Send(3611896190, payload);
-
+            window.__psc.Send(CMD, payload);
             try {
                 const resp = await respPromise;
                 for (const u of (resp.payload?.rankList || [])) {
                     if (u.userID) seen.add(String(u.userID));
                 }
-            } catch (_) { /* 该省无数据，跳过 */ }
-
-            if (pid < provinceMax) await new Promise(r => setTimeout(r, delayMs));
+            } catch (_) {}
+            if (pid < provinceMax) await delay(delayMs);
         }
-
         return [...seen];
-    }, PROVINCE_MAX, DELAY_MS);
+    }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
+    console.log(`   ✅ 省级榜 ${provinceIds.length} 人`);
 
-    console.log(`   ✅ 收集到 ${userIds.length} 个去重 UserID`);
+    // ── Step 1C：好友推荐"换一批" ───────────────────────────────
+    console.log(`\n📊 Step 1C：好友推荐（${FRIEND_ROUNDS} 轮 × ~20 人）...`);
+    const friendIds = await page.evaluate(async (CMD, rounds, delayMs) => {
+        const seen = new Set();
+        for (let i = 0; i < rounds; i++) {
+            const respPromise = waitForMsg('cmsg.CRespFriendRecommend', 6000);
+            window.__psc.Send(CMD, new Uint8Array(0));
+            try {
+                const resp = await respPromise;
+                for (const u of (resp.payload?.users || [])) {
+                    if (u.userID) seen.add(String(u.userID));
+                }
+            } catch (_) {}
+            if ((i + 1) % 50 === 0) {
+                console.log('[好友推荐] ' + (i + 1) + '/' + rounds + ' | UserID: ' + seen.size);
+            }
+            await delay(delayMs);
+        }
+        return [...seen];
+    }, CMD_FRIEND_RECOMMEND, FRIEND_ROUNDS, DELAY_MS);
+    console.log(`   ✅ 好友推荐 ${friendIds.length} 人`);
 
-    // ── Step 2：按 UserID 查询 GameID ────────────────────────────
-    console.log(`\n🎮 Step 2：查询 ${userIds.length} 个玩家的对局记录...`);
+    // ── 合并去重 UserID ─────────────────────────────────────────
+    const allUserIdSet = new Set([...officialIds.ids, ...provinceIds, ...friendIds]);
+    const allUserIds = [...allUserIdSet];
+    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialIds.ids.length} + 省级${provinceIds.length} + 好友${friendIds.length})`);
+
+    // ── Step 2：查询 GameID ─────────────────────────────────────
+    console.log(`\n🎮 Step 2：查询 ${allUserIds.length} 个玩家的对局记录...`);
     console.log(`   保留模式: [${KEEP_MODES.join(', ')}]`);
 
-    const allGameIds = await page.evaluate(async (userIds, keepModes, delayMs) => {
-        function encodeVarint(v) {
-            let val = BigInt(v), bytes = [];
-            while (val > 127n) { bytes.push(Number(val & 0x7Fn) | 0x80); val >>= 7n; }
-            bytes.push(Number(val));
-            return bytes;
-        }
-        function encodeField(f, v) { return [(f << 3) | 0, ...encodeVarint(v)]; }
-
-        // modeID 可能是 enum 字符串
-        const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4 };
-        function modeToInt(m) {
-            return typeof m === 'string' ? (MODE_STR[m] || 0) : (m || 0);
-        }
-
-        function waitForMsg(name, timeoutMs = 8000) {
-            return new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error(`timeout:${name}`)), timeoutMs);
-                const cap = window.__cap;
-                cap.hooks[name] = cap.hooks[name] || [];
-                cap.hooks[name].push(m => { clearTimeout(t); resolve(m); });
-            });
-        }
-
+    const allGameIds = await page.evaluate(async (userIds, CMD, keepModes, delayMs) => {
         const seen = new Set();
-        const results = [];  // [{userId, gameIds:[]}]
+        const results = [];
 
         for (let i = 0; i < userIds.length; i++) {
             const uid = userIds[i];
             const payload = new Uint8Array(encodeField(1, uid));
-
             const respPromise = waitForMsg('cmsg.CRespGetNewGameRecord', 8000);
-            window.__psc.Send(1065628532, payload);
+            window.__psc.Send(CMD, payload);
 
             try {
                 const resp = await respPromise;
@@ -271,44 +401,50 @@ async function main() {
                     .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
                     .map(r => String(r.gameID))
                     .filter(g => g && g !== '0' && !seen.has(g));
-
                 for (const g of gameIds) seen.add(g);
                 results.push({ userId: uid, gameIds });
             } catch (_) {
                 results.push({ userId: uid, gameIds: [] });
             }
 
-            if ((i + 1) % 50 === 0 || i === userIds.length - 1) {
+            if ((i + 1) % 100 === 0 || i === userIds.length - 1) {
                 const pct = ((i + 1) / userIds.length * 100).toFixed(1);
-                console.log(`[进度] ${i + 1}/${userIds.length} (${pct}%) | GameID: ${seen.size}`);
+                console.log('[进度] ' + (i+1) + '/' + userIds.length + ' (' + pct + '%) | GameID: ' + seen.size);
             }
-
-            if (i < userIds.length - 1) await new Promise(r => setTimeout(r, delayMs));
+            if (i < userIds.length - 1) await delay(delayMs);
         }
-
         return { results, totalGameIds: seen.size };
-    }, userIds, KEEP_MODES, DELAY_MS);
+    }, allUserIds, CMD_GET_GAME_RECORD, KEEP_MODES, DELAY_MS);
 
     console.log(`   ✅ 共 ${allGameIds.totalGameIds} 个去重 GameID`);
 
     await browser.close();
 
-    // ── 保存到 data/gameids/ ─────────────────────────────────────
-    const today    = new Date().toISOString().slice(0, 10);
-    const outPath  = path.join(GAMEIDS_DIR, `${today}.json`);
-    const outData  = {
+    // ── 保存 ────────────────────────────────────────────────────
+    const now     = new Date();
+    const today   = now.toISOString().slice(0, 10);
+    const timeTag = now.toISOString().slice(11, 16).replace(':', '');  // HHMM
+    const outPath = path.join(GAMEIDS_DIR, `${today}_${timeTag}.json`);
+    const outData = {
         metadata: {
-            date:       today,
-            userIds:    userIds.length,
-            gameIds:    allGameIds.totalGameIds,
-            keepModes:  KEEP_MODES,
-            provinces:  PROVINCE_MAX + 1,
+            date:         today,
+            time:         now.toISOString(),
+            account:      SGS_ACCOUNT,
+            sources: {
+                officialRank: officialIds.ids.length,
+                provincial:   provinceIds.length,
+                friendRec:    friendIds.length,
+            },
+            totalUserIds: allUserIds.length,
+            totalGameIds: allGameIds.totalGameIds,
+            keepModes:    KEEP_MODES,
+            friendRounds: FRIEND_ROUNDS,
         },
         results: allGameIds.results,
     };
     fs.writeFileSync(outPath, JSON.stringify(outData, null, 2), 'utf8');
     console.log(`\n💾 已保存：${outPath}`);
-    console.log(`   ${userIds.length} 个 UserID → ${allGameIds.totalGameIds} 个 GameID`);
+    console.log(`   ${allUserIds.length} 个 UserID → ${allGameIds.totalGameIds} 个 GameID`);
 }
 
 main().catch(err => {
