@@ -160,12 +160,13 @@ async function main() {
 
         // 诊断计数器
         window.__diag = {
-            hookCalls: 0,         // _hook 被调用总次数
-            logSetAttempts: 0,    // 游戏尝试覆盖 console.log 的次数
-            consoleSetAttempts: 0,// 游戏尝试替换 window.console 的次数
-            samples: [],          // 前 20 次 console.log 调用的参数摘要
+            hookCalls: 0,
+            logSetAttempts: 0,
+            consoleSetAttempts: 0,
+            samples: [],          // 前 10 次 console.log（初始化阶段）
+            cmsgSamples: [],      // 所有包含 "cmsg" 的 console.log（不限数量）
             otherMethods: { warn: 0, info: 0, debug: 0, error: 0 },
-            otherSamples: [],     // 其他 console 方法的参数摘要（前 10 条）
+            otherSamples: [],
         };
 
         const _orig = console.log.bind(console);
@@ -190,9 +191,14 @@ async function main() {
             _orig(...args);
             window.__diag.hookCalls++;
             try {
-                // 采样前 20 次调用
-                if (window.__diag.samples.length < 20) {
+                // 前 10 次通用采样
+                if (window.__diag.samples.length < 10) {
                     window.__diag.samples.push(_summarize(args));
+                }
+                // 所有包含 "cmsg" 的调用单独记录（看协议消息的实际格式）
+                const joined = args.map(a => typeof a === 'string' ? a : '').join(' ');
+                if (joined.includes('cmsg')) {
+                    window.__diag.cmsgSamples.push(_summarize(args));
                 }
                 const m = args[0];
                 if (m && typeof m === 'object' && typeof m.name === 'string' && m.payload != null) {
@@ -356,9 +362,12 @@ async function main() {
                 // ④ 捕获到的消息
                 msgCount: cap ? cap.msgs.length : -1,
                 msgNames: cap ? [...new Set(cap.msgs.map(m => m.name))] : [],
-                // ⑤ console.log 调用参数采样（前 20 次）
+                // ⑤ console.log 初始化采样
                 samples: d.samples || [],
-                // ⑥ 其他 console 方法调用统计
+                // ⑥ 所有包含 "cmsg" 的调用（关键！看协议消息格式）
+                cmsgSamples: d.cmsgSamples || [],
+                cmsgCount: (d.cmsgSamples || []).length,
+                // ⑦ 其他 console 方法调用统计
                 otherMethods: d.otherMethods || {},
                 otherSamples: d.otherSamples || [],
             };
