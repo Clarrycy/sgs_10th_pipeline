@@ -70,6 +70,7 @@ async function main() {
     console.log('🚀 启动无头浏览器...');
     const browser = await puppeteer.launch({
         headless: 'new',
+        protocolTimeout: 0,   // 采集阶段单次 page.evaluate 可能跑 30+ 分钟
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
