@@ -1,0 +1,12 @@
+{
+  "name": "sgs-pipeline",
+  "version": "1.0.0",
+  "description": "三国杀十周年录像批量采集 & 解析流水线",
+  "scripts": {
+    "collect":      "node collect/collect.js",
+    "save-cookies": "node collect/save_cookies.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0"
+  }
+}

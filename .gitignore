@@ -1,0 +1,31 @@
+# ── 录像文件（体积大，本地保留，不入库）
+data/replays/
+
+# ── 解析结果（可选：如果公开数据则删除此行）
+# data/output/
+
+# ── GameID 文件（可选：如不想公开采集来源则取消注释）
+# data/gameids/
+
+# ── Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── macOS
+.DS_Store
+
+# ── Cookie 文件（绝对不要提交）
+cookies.json
+.env
+*.env
+
+# ── IDE
+.idea/
+.vscode/
+*.swp
