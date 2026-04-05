@@ -7,8 +7,6 @@
     "save-cookies": "node collect/save_cookies.js"
   },
   "dependencies": {
-    "puppeteer": "^22.0.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer": "^22.0.0"
   }
 }

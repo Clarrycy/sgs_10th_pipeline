@@ -20,12 +20,9 @@
  *   node collect/collect.js
  */
 
-const puppeteer     = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
-
-const fs   = require('fs');
-const path = require('path');
+const puppeteer = require('puppeteer');
+const fs        = require('fs');
+const path      = require('path');
 
 // ─────────────────── 配置 ───────────────────
 
@@ -63,6 +60,20 @@ async function main() {
 
     const page = await browser.newPage();
     page.setDefaultTimeout(0);  // 禁用全局超时，长任务需要
+
+    // ── 反自动化检测（手动实现，不依赖第三方插件） ───────────────
+    await page.setUserAgent(
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    );
+    await page.evaluateOnNewDocument(() => {
+        // 隐藏 webdriver 标记
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        // 伪造插件列表（无头浏览器通常为空）
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        // 伪造语言
+        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+    });
 
     // ── 注入 console.log 拦截（必须在页面加载前） ────────────────
     await page.evaluateOnNewDocument(() => {

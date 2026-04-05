@@ -16,13 +16,10 @@
  * 注意：cookies.json 已加入 .gitignore，不要手动提交它。
  */
 
-const puppeteer     = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
-
-const fs       = require('fs');
-const path     = require('path');
-const readline = require('readline');
+const puppeteer = require('puppeteer');
+const fs        = require('fs');
+const path      = require('path');
+const readline  = require('readline');
 
 const LOGIN_URL = 'https://web.sanguosha.com/login/index.html';
 const OUT_PATH  = path.resolve(__dirname, '..', 'cookies.json');
