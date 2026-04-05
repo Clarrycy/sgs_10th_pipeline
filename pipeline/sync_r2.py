@@ -189,6 +189,103 @@ def list_r2():
             count += 1
     print(f'\n共 {count} 个对象，总计 {total_size/1024/1024:.1f} MB')
 
+# ─────────────────── 删除 ───────────────────
+
+def delete_prefix(prefix):
+    """删除 R2 中指定前缀下的所有对象。"""
+    client, bucket = get_client()
+    paginator = client.get_paginator('list_objects_v2')
+    deleted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = [{'Key': obj['Key']} for obj in page.get('Contents', [])]
+        if objects:
+            client.delete_objects(Bucket=bucket, Delete={'Objects': objects})
+            deleted += len(objects)
+            for o in objects:
+                print(f'  🗑️ {o["Key"]}')
+    print(f'✅ 删除完成（{deleted} 个对象，前缀: {prefix}）')
+
+
+# ─────────────────── 清理过期数据 ───────────────────
+
+def cleanup_old_r2(days_gameids=30, days_cache=7):
+    """清理 R2 上超过指定天数的 gameids 和 cache 文件。
+    基于文件名中的日期判断（YYYY-MM-DD）。
+    """
+    import re
+    from datetime import datetime, timedelta
+
+    client, bucket = get_client()
+    paginator = client.get_paginator('list_objects_v2')
+
+    today = datetime.now()
+    date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
+    to_delete = []
+
+    for prefix, max_days, label in [
+        ('gameids/', days_gameids, 'batch 文件'),
+        ('cache/',   days_cache,   '榜单缓存'),
+    ]:
+        count = 0
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                m = date_pattern.search(key)
+                if m:
+                    try:
+                        file_date = datetime.strptime(m.group(1), '%Y-%m-%d')
+                        if (today - file_date).days > max_days:
+                            to_delete.append(key)
+                            count += 1
+                    except ValueError:
+                        pass
+        if count:
+            print(f'  {label}: {count} 个过期（>{max_days} 天）')
+
+    if not to_delete:
+        print('  ℹ️ 没有需要清理的过期数据')
+        return
+
+    # 批量删除（每次最多 1000 个）
+    for i in range(0, len(to_delete), 1000):
+        batch = [{'Key': k} for k in to_delete[i:i+1000]]
+        client.delete_objects(Bucket=bucket, Delete={'Objects': batch})
+
+    print(f'🗑️ 已清理 {len(to_delete)} 个过期 R2 对象')
+
+
+def cleanup_old_local(days_gameids=30, days_cache=7):
+    """清理本地超过指定天数的 gameids 和 cache 文件。"""
+    import re
+    from datetime import datetime
+
+    today = datetime.now()
+    date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
+    deleted = 0
+
+    for local_dir, max_days, label in [
+        (GAMEID_DIR, days_gameids, 'batch 文件'),
+        (CACHE_DIR,  days_cache,   '榜单缓存'),
+    ]:
+        if not local_dir.is_dir():
+            continue
+        for f in local_dir.glob('*.json'):
+            m = date_pattern.search(f.name)
+            if m:
+                try:
+                    file_date = datetime.strptime(m.group(1), '%Y-%m-%d')
+                    if (today - file_date).days > max_days:
+                        f.unlink()
+                        deleted += 1
+                except ValueError:
+                    pass
+
+    if deleted:
+        print(f'🗑️ 本地清理 {deleted} 个过期文件')
+    else:
+        print('  ℹ️ 本地没有过期文件')
+
+
 # ─────────────────── 主流程 ───────────────────
 
 def main():
@@ -197,6 +294,10 @@ def main():
     group.add_argument('--push', action='store_true', help='上传本地结果到 R2')
     group.add_argument('--pull', action='store_true', help='从 R2 拉取结果到本地')
     group.add_argument('--list', action='store_true', help='列出 R2 中的文件')
+    group.add_argument('--delete-prefix', type=str, metavar='PREFIX',
+                       help='删除 R2 中指定前缀下的所有对象')
+    group.add_argument('--cleanup', action='store_true',
+                       help='清理 R2 和本地的过期 gameids (>30天) 和 cache (>7天)')
     ap.add_argument('--replays', action='store_true', help='--push 时同时上传 .sgs 录像（体积大）')
     args = ap.parse_args()
 
@@ -206,6 +307,12 @@ def main():
         pull()
     elif args.list:
         list_r2()
+    elif args.delete_prefix:
+        delete_prefix(args.delete_prefix)
+    elif args.cleanup:
+        print('🧹 清理过期数据...')
+        cleanup_old_r2(days_gameids=30, days_cache=7)
+        cleanup_old_local(days_gameids=30, days_cache=7)
 
 
 if __name__ == '__main__':

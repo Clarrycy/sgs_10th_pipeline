@@ -79,6 +79,13 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python pipeline/sync_r2.py --push
 
-      # ── 清理 runner 上的 .sgs（runner 不持久，本步防止磁盘撑满）
-      - name: Cleanup replays
-        run: python pipeline/download.py --cleanup --days=1
+      # ── 清理过期数据（R2 + 本地）
+      - name: Cleanup old data
+        env:
+          R2_ENDPOINT:          ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python pipeline/sync_r2.py --cleanup
+          python pipeline/download.py --cleanup --days=30
