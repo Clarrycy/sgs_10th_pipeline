@@ -154,17 +154,46 @@ async function main() {
         window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
     });
 
-    // ── console.log 拦截 ────────────────────────────────────────
+    // ── console.log 拦截 + 全面诊断 ─────────────────────────────
     await page.evaluateOnNewDocument(() => {
         window.__cap = { msgs: [], hooks: {} };
 
-        // evaluateOnNewDocument 在 document-start 运行，此时 console.log
-        // 就是浏览器原始版本（还没有任何页面脚本运行过），无需 iframe。
+        // 诊断计数器
+        window.__diag = {
+            hookCalls: 0,         // _hook 被调用总次数
+            logSetAttempts: 0,    // 游戏尝试覆盖 console.log 的次数
+            consoleSetAttempts: 0,// 游戏尝试替换 window.console 的次数
+            samples: [],          // 前 20 次 console.log 调用的参数摘要
+            otherMethods: { warn: 0, info: 0, debug: 0, error: 0 },
+            otherSamples: [],     // 其他 console 方法的参数摘要（前 10 条）
+        };
+
         const _orig = console.log.bind(console);
+
+        // 生成参数摘要（防止序列化爆炸）
+        function _summarize(args) {
+            return args.map(a => {
+                if (a == null) return String(a);
+                if (typeof a === 'string') return a.slice(0, 120);
+                if (typeof a !== 'object') return String(a);
+                // 对象：记录 keys 和关键字段
+                const keys = Object.keys(a).slice(0, 10);
+                const s = { _type: typeof a, _keys: keys };
+                if (a.name) s.name = a.name;
+                if (a.payload !== undefined) s.hasPayload = true;
+                if (a.sent !== undefined) s.hasSent = true;
+                return s;
+            });
+        }
 
         const _hook = function (...args) {
             _orig(...args);
+            window.__diag.hookCalls++;
             try {
+                // 采样前 20 次调用
+                if (window.__diag.samples.length < 20) {
+                    window.__diag.samples.push(_summarize(args));
+                }
                 const m = args[0];
                 if (m && typeof m === 'object' && typeof m.name === 'string' && m.payload != null) {
                     window.__cap.msgs.push({ name: m.name, payload: m.payload, sent: m.sent });
@@ -176,21 +205,44 @@ async function main() {
             } catch (_) {}
         };
 
-        // 锁住 console.log，防止游戏覆盖
+        // 锁住 console.log
         Object.defineProperty(console, 'log', {
             get: () => _hook,
-            set: () => {},
+            set: () => { window.__diag.logSetAttempts++; },
             configurable: true,
         });
 
-        // 游戏会替换整个 window.console 对象（基础款靠 iframe 恢复 console 就是这个原因）
-        // 锁住 window.console，防止整个对象被替换
+        // 锁住 window.console
         const _console = console;
         Object.defineProperty(window, 'console', {
             get: () => _console,
-            set: () => {},
+            set: () => { window.__diag.consoleSetAttempts++; },
             configurable: true,
         });
+
+        // 也 hook console.warn/info/debug/error，看游戏是不是走这些方法
+        for (const method of ['warn', 'info', 'debug', 'error']) {
+            const origMethod = _console[method]?.bind(_console);
+            const methodName = method;
+            _console[method] = function (...args) {
+                if (origMethod) origMethod(...args);
+                window.__diag.otherMethods[methodName]++;
+                if (window.__diag.otherSamples.length < 10) {
+                    window.__diag.otherSamples.push({ method: methodName, args: _summarize(args) });
+                }
+                // 也检查是否有消息格式的对象
+                try {
+                    const m = args[0];
+                    if (m && typeof m === 'object' && typeof m.name === 'string' && m.payload != null) {
+                        window.__cap.msgs.push({ name: m.name, payload: m.payload, sent: m.sent });
+                        const waiters = window.__cap.hooks[m.name];
+                        if (waiters && waiters.length) {
+                            waiters.splice(0).forEach(fn => fn(m));
+                        }
+                    }
+                } catch (_) {}
+            };
+        }
     });
 
     // ── 登录 ────────────────────────────────────────────────────
@@ -289,21 +341,30 @@ async function main() {
             );
         }, { timeout: 60000 });
     } catch (_) {
-        // 诊断：hook 是否存活、捕获了哪些消息
         const diag = await page.evaluate(() => {
             const cap = window.__cap;
-            if (!cap) return { error: '__cap not found — hook未安装' };
-            const names = cap.msgs.map(m => m.name);
-            // 检测 console.log 是否仍是我们的 hook
+            const d = window.__diag || {};
             const desc = Object.getOwnPropertyDescriptor(console, 'log');
             return {
-                msgCount: cap.msgs.length,
-                msgNames: [...new Set(names)],
-                hasGetter: !!(desc && desc.get),
-                hookAlive: typeof desc?.get === 'function',
+                // ① hook 是否存活
+                hookAlive: !!(desc && desc.get),
+                // ② console.log 被调用了多少次
+                hookCalls: d.hookCalls || 0,
+                // ③ 游戏尝试覆盖的次数
+                logSetAttempts: d.logSetAttempts || 0,
+                consoleSetAttempts: d.consoleSetAttempts || 0,
+                // ④ 捕获到的消息
+                msgCount: cap ? cap.msgs.length : -1,
+                msgNames: cap ? [...new Set(cap.msgs.map(m => m.name))] : [],
+                // ⑤ console.log 调用参数采样（前 20 次）
+                samples: d.samples || [],
+                // ⑥ 其他 console 方法调用统计
+                otherMethods: d.otherMethods || {},
+                otherSamples: d.otherSamples || [],
             };
         });
-        console.error('❌ 认证超时 — 诊断:', JSON.stringify(diag, null, 2));
+        console.error('❌ 认证超时 — 全面诊断:');
+        console.error(JSON.stringify(diag, null, 2));
         await browser.close();
         process.exit(1);
     }
