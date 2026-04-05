@@ -156,15 +156,14 @@ async function main() {
 
     // ── console.log 拦截 ────────────────────────────────────────
     await page.evaluateOnNewDocument(() => {
-        const _iframe = document.createElement('iframe');
-        _iframe.style.display = 'none';
-        document.head.appendChild(_iframe);
-        const _nativeLog = _iframe.contentWindow.console.log;
+        // 先创建 __cap，再 hook console.log
+        // 不依赖 document.head（evaluateOnNewDocument 在 document-start 运行时 head 可能不存在）
         window.__cap = { msgs: [], hooks: {} };
-        const _orig = console.log;
+
+        // 保存原始 console.log（不用 iframe 方式，避免 DOM 依赖）
+        const _orig = console.log.bind(console);
         console.log = function (...args) {
-            _orig.apply(console, args);
-            _nativeLog.apply(console, args);
+            _orig(...args);
             try {
                 const m = args[0];
                 if (m && typeof m === 'object' && typeof m.name === 'string' && m.payload != null) {
