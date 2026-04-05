@@ -20,10 +20,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
       - name: Install Node dependencies
-        run: npm install
+        run: npm ci
 
       # ── Python（下载 + 解析 + 同步）
       - name: Setup Python
@@ -43,12 +42,6 @@ jobs:
           R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python pipeline/sync_r2.py --pull
-
-      - name: Debug proxy-agent
-        run: |
-          ls -la node_modules/proxy-agent/dist/ || echo "dist/ missing"
-          cat node_modules/proxy-agent/package.json | head -10
-          node -e "require('proxy-agent'); console.log('proxy-agent OK')"
 
       # ── Puppeteer 采集：官阶榜 + 省级榜 + 好友推荐 → GameID
       - name: Collect GameIDs
