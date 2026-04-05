@@ -44,6 +44,12 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python pipeline/sync_r2.py --pull
 
+      - name: Debug proxy-agent
+        run: |
+          ls -la node_modules/proxy-agent/dist/ || echo "dist/ missing"
+          cat node_modules/proxy-agent/package.json | head -10
+          node -e "require('proxy-agent'); console.log('proxy-agent OK')"
+
       # ── Puppeteer 采集：官阶榜 + 省级榜 + 好友推荐 → GameID
       - name: Collect GameIDs
         env:
