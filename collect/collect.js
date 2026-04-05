@@ -280,7 +280,21 @@ async function main() {
             );
         }, { timeout: 60000 });
     } catch (_) {
-        console.error('❌ 认证超时');
+        // 诊断：hook 是否存活、捕获了哪些消息
+        const diag = await page.evaluate(() => {
+            const cap = window.__cap;
+            if (!cap) return { error: '__cap not found — hook未安装' };
+            const names = cap.msgs.map(m => m.name);
+            // 检测 console.log 是否仍是我们的 hook
+            const desc = Object.getOwnPropertyDescriptor(console, 'log');
+            return {
+                msgCount: cap.msgs.length,
+                msgNames: [...new Set(names)],
+                hasGetter: !!(desc && desc.get),
+                hookAlive: typeof desc?.get === 'function',
+            };
+        });
+        console.error('❌ 认证超时 — 诊断:', JSON.stringify(diag, null, 2));
         await browser.close();
         process.exit(1);
     }
