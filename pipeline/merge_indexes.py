@@ -203,7 +203,10 @@ def merge_batch(batch, indexes):
 
             per_mode_user_games.setdefault(mode_id, {}).setdefault(user_id, []).append(game_id)
 
-        idx['lastBatchId'] = batch_id
+    # 更新每个 mode index 的 lastBatchId
+    for mode in MODE_CONFIG:
+        if indexes[mode]['games']:
+            indexes[mode]['lastBatchId'] = batch_id
 
     return per_mode_user_games, war_rows
 
