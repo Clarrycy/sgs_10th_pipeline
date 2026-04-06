@@ -155,6 +155,27 @@ async function main() {
         const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4, MITShenFenJingji: 4 };
         window.modeToInt = function(m) { return typeof m === 'string' ? (MODE_STR[m] || 0) : (m || 0); };
         window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
+
+        // 收集恰好 N 条同名响应（用于并发批量请求）
+        window.collectNMsgs = function(name, n, timeoutMs) {
+            timeoutMs = timeoutMs || 30000;
+            return new Promise(resolve => {
+                const results = [];
+                const deadline = setTimeout(() => resolve(results), timeoutMs);
+                const cap = window.__cap;
+                cap.hooks[name] = cap.hooks[name] || [];
+                function handler(m) {
+                    results.push(m);
+                    if (results.length >= n) {
+                        clearTimeout(deadline);
+                        resolve(results);
+                    } else {
+                        cap.hooks[name].push(handler);
+                    }
+                }
+                cap.hooks[name].push(handler);
+            });
+        };
     });
 
     // ── console.log 拦截 ────────────────────────────────────────
@@ -528,51 +549,74 @@ async function main() {
     const allUserIds = [...allUserIdSet];
     console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 斗地主${doudizhuRankIds.length} + 好友${friendIds.length})`);
 
-    // ── Step 2：查询 GameID ─────────────────────────────────────
-    console.log(`\n🎮 Step 2：查询 ${allUserIds.length} 个玩家的对局记录...`);
+    // ── Step 2：查询 GameID（并发批量）──────────────────────────
+    const GAME_BATCH = 100;        // 每批并发请求数
+    const BATCH_SLEEP_MIN = 2000;  // 批次间隔下限 ms
+    const BATCH_SLEEP_MAX = 5000;  // 批次间隔上限 ms
+    console.log(`\n🎮 Step 2：查询 ${allUserIds.length} 个玩家的对局记录（${GAME_BATCH} 并发, ${BATCH_SLEEP_MIN/1000}-${BATCH_SLEEP_MAX/1000}s 间隔）...`);
     console.log(`   保留模式: [${KEEP_MODES.join(', ')}]`);
 
-    const allGameIds = await page.evaluate(async (userIds, CMD, keepModes, delayMs) => {
+    const allGameIds = await page.evaluate(async (userIds, CMD, keepModes, batchSize, sleepMin, sleepMax) => {
         const seen = new Set();
         const results = [];
+        const totalBatches = Math.ceil(userIds.length / batchSize);
 
-        for (let i = 0; i < userIds.length; i++) {
-            const uid = userIds[i];
-            const payload = new Uint8Array(encodeField(1, uid));
-            const respPromise = waitForMsg('cmsg.CRespGetNewGameRecord', 8000);
-            window.__psc.Send(CMD, payload);
+        for (let b = 0; b < totalBatches; b++) {
+            const start = b * batchSize;
+            const end = Math.min(start + batchSize, userIds.length);
+            const batch = userIds.slice(start, end);
 
-            try {
-                const resp = await respPromise;
-                const records = resp.payload?.recordData?.saveRecordList || [];
-                const gameIds = records
-                    .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
-                    .map(r => ({
-                        gameId:      String(r.gameID),
-                        modeId:      modeToInt(r.modeID),
-                        gameTime:    r.gameStartTime || 0,
-                        result:      r.gameResult || '',
-                        isMvp:       !!r.isMvp,
-                        isEscape:    !!r.isEscape,
-                        figure:      r.figure || 0,
-                        generalId:   (r.usingCharacters || [])[0] || 0,
-                        scoreChange: r.scoreChange || 0,
-                    }))
-                    .filter(o => o.gameId && o.gameId !== '0' && !seen.has(o.gameId));
-                for (const o of gameIds) seen.add(o.gameId);
-                results.push({ userId: uid, gameIds });
-            } catch (_) {
-                results.push({ userId: uid, gameIds: [] });
+            // 先注册响应收集器，再批量发送请求（WebSocket 保序）
+            const respPromise = collectNMsgs(
+                'cmsg.CRespGetNewGameRecord',
+                batch.length,
+                batch.length * 500 + 15000,
+            );
+            for (const uid of batch) {
+                window.__psc.Send(CMD, new Uint8Array(encodeField(1, uid)));
+            }
+            const responses = await respPromise;
+
+            // 按发送顺序匹配响应
+            for (let j = 0; j < batch.length; j++) {
+                const uid = batch[j];
+                const resp = j < responses.length ? responses[j] : null;
+                if (resp) {
+                    const records = resp.payload?.recordData?.saveRecordList || [];
+                    const gameIds = records
+                        .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
+                        .map(r => ({
+                            gameId:      String(r.gameID),
+                            modeId:      modeToInt(r.modeID),
+                            gameTime:    r.gameStartTime || 0,
+                            result:      r.gameResult || '',
+                            isMvp:       !!r.isMvp,
+                            isEscape:    !!r.isEscape,
+                            figure:      r.figure || 0,
+                            generalId:   (r.usingCharacters || [])[0] || 0,
+                            scoreChange: r.scoreChange || 0,
+                        }))
+                        .filter(o => o.gameId && o.gameId !== '0' && !seen.has(o.gameId));
+                    for (const o of gameIds) seen.add(o.gameId);
+                    results.push({ userId: uid, gameIds });
+                } else {
+                    results.push({ userId: uid, gameIds: [] });
+                }
             }
 
-            if ((i + 1) % 100 === 0 || i === userIds.length - 1) {
-                const pct = ((i + 1) / userIds.length * 100).toFixed(1);
-                console.log('[进度] ' + (i+1) + '/' + userIds.length + ' (' + pct + '%) | GameID: ' + seen.size);
+            const pct = (end / userIds.length * 100).toFixed(1);
+            console.log('[进度] 批次 ' + (b+1) + '/' + totalBatches
+                + ' | 已查 ' + end + '/' + userIds.length + ' (' + pct + '%)'
+                + ' | GameID: ' + seen.size);
+
+            // 随机间隔 2-5 秒
+            if (b < totalBatches - 1) {
+                const sleepMs = sleepMin + Math.random() * (sleepMax - sleepMin);
+                await delay(sleepMs);
             }
-            if (i < userIds.length - 1) await delay(delayMs);
         }
         return { results, totalGameIds: seen.size };
-    }, allUserIds, CMD_GET_GAME_RECORD, KEEP_MODES, DELAY_MS);
+    }, allUserIds, CMD_GET_GAME_RECORD, KEEP_MODES, GAME_BATCH, BATCH_SLEEP_MIN, BATCH_SLEEP_MAX);
 
     console.log(`   ✅ 共 ${allGameIds.totalGameIds} 个去重 GameID`);
 
