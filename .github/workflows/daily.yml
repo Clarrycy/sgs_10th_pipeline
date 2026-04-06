@@ -3,7 +3,7 @@ name: Daily Pipeline
 on:
   schedule:
     # 每 2 小时跑一次（公开仓库不限分钟数）
-    # 两个账号按小时轮替：偶数小时用账号1，奇数小时用账号2
+    # 账号按当前小时对账号数取模轮替，支持任意数量账号
     - cron: '0 */2 * * *'
   workflow_dispatch:        # 支持手动触发
 
@@ -69,6 +69,14 @@ jobs:
 
       - name: Parse Doudizhu
         run: python pipeline/parse_doudizhu.py --quiet --update-index
+
+      # ── 逃跑玩家官阶补全（parse 后、push 前）
+      - name: Enrich escaped player ranks
+        env:
+          SGS_ACCOUNTS:   ${{ secrets.SGS_ACCOUNTS || secrets.SGS_ACCOUNT }}
+          SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS || secrets.SGS_PASSWORD }}
+          REQUEST_DELAY:  '300'
+        run: python pipeline/enrich_ranks.py
 
       # ── 上传结果回 R2（output/ + indexes/ + cache/）
       - name: Push results to R2
