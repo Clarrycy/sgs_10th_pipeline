@@ -680,19 +680,16 @@ async function runBoards() {
 
 async function runFriends() {
     const { accounts, passwords } = parseAccounts();
-    console.log(`📋 [friends] ${accounts.length} 个账号并行, 每账号 ${FRIEND_ROUNDS} 轮\n`);
+    console.log(`📋 [friends] ${accounts.length} 个账号串行登录 → 并行采集, 每账号 ${FRIEND_ROUNDS} 轮\n`);
 
-    // 并行登录所有账号
-    const sessionResults = await Promise.allSettled(
-        accounts.map((acc, i) => setupSession(acc, passwords[i]))
-    );
-
+    // 串行登录（同 IP 并发 WebSocket 会被服务器限流，逐个等认证通过）
     const sessions = [];
-    for (let i = 0; i < sessionResults.length; i++) {
-        if (sessionResults[i].status === 'fulfilled') {
-            sessions.push(sessionResults[i].value);
-        } else {
-            console.error(`❌ 账号 ${accounts[i]} 登录失败: ${sessionResults[i].reason.message}`);
+    for (let i = 0; i < accounts.length; i++) {
+        try {
+            const session = await setupSession(accounts[i], passwords[i]);
+            sessions.push(session);
+        } catch (err) {
+            console.error(`❌ 账号 ${accounts[i]} 登录失败: ${err.message}`);
         }
     }
 
