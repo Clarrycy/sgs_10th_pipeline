@@ -160,7 +160,7 @@ def find_events_start(data):
     返回起始偏移量，未找到返回 None。
     """
     pos = 0x100
-    limit = min(len(data), 0x2000)
+    limit = min(len(data), 0x8000)  # 扩大到 32KB，兼容超长对局的大 header
     while pos + 32 < limit:
         marker = struct.unpack_from('<I', data, pos + 4)[0]
         if marker in (1, 2):
