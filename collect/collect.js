@@ -4,28 +4,29 @@
 /**
  * SGS 全自动采集脚本  collect/collect.js
  *
- * 采集源（A/B/B2 每日缓存，C 每次重新刷）：
- *   A.  官阶榜 top 500（rankType=20, 自动分页 5×100）
- *   B.  省级排位榜 34 省 × top 100（rankType=5, modeID=8 2v2）
- *   B2. 省级身份排位榜 全服+34 省（rankType=5, modeID=4 身份竞技）
- *   C.  好友推荐"换一批"（CReqFriendRecommend, ~20 人/次, 刷 N 轮）
- *   → 所有去重 UserID 查战绩 → GameID（含 modeId）
+ * 三种运行模式：
+ *   --mode=boards   榜单线：单账号轮替，抓排行榜 + 查战绩（Line A, 每小时）
+ *   --mode=friends  好友线：全量账号并行，好友推荐 + 查战绩（Line B, 每 4 小时）
+ *   (无参数)        完整模式：向后兼容，单账号跑全部
  *
  * 环境变量：
- *   SGS_ACCOUNTS    登录账号（逗号分隔，按小时轮替）
+ *   SGS_ACCOUNTS    登录账号（逗号分隔）
  *   SGS_PASSWORDS   登录密码（逗号分隔，与账号一一对应）
  *   KEEP_MODES      保留的模式 ID（默认 "4,8,36"）
  *   PROVINCE_MAX    最大省份 ID（默认 33）
- *   FRIEND_ROUNDS   好友推荐刷新轮数（默认 100，约 2000 人）
+ *   FRIEND_ROUNDS   好友推荐刷新轮数（friends 模式默认 200，其他默认 300）
  *   REQUEST_DELAY   请求间隔 ms（默认 300）
- *
- * 用法：
- *   SGS_ACCOUNTS=a1,a2 SGS_PASSWORDS=p1,p2 node collect/collect.js
  */
 
 const puppeteer = require('puppeteer');
 const fs        = require('fs');
 const path      = require('path');
+
+// ─────────────────── 模式解析 ───────────────────
+
+const MODE = process.argv.includes('--mode=friends') ? 'friends'
+           : process.argv.includes('--mode=boards')  ? 'boards'
+           : 'full';
 
 // ─────────────────── 配置 ───────────────────
 
@@ -33,25 +34,26 @@ const LOGIN_URL      = 'https://web.sanguosha.com/login/index.html';
 const GAME_URL       = 'https://web.sanguosha.com/10/';
 const KEEP_MODES     = (process.env.KEEP_MODES || '4,8,36').split(',').map(Number);
 const PROVINCE_MAX   = parseInt(process.env.PROVINCE_MAX || '33', 10);
-const FRIEND_ROUNDS  = parseInt(process.env.FRIEND_ROUNDS || '100', 10);
+const FRIEND_ROUNDS  = parseInt(process.env.FRIEND_ROUNDS || (MODE === 'friends' ? '200' : '300'), 10);
 const DELAY_MS       = parseInt(process.env.REQUEST_DELAY || '300', 10);
 
 const ROOT        = path.resolve(__dirname, '..');
 const GAMEIDS_DIR = path.join(ROOT, 'data', 'gameids');
 const CACHE_DIR   = path.join(ROOT, 'data', 'cache');
 
+const GAME_BATCH      = 100;   // 每批并发请求数
+const BATCH_SLEEP_MIN = 2000;  // 批次间隔下限 ms
+const BATCH_SLEEP_MAX = 5000;  // 批次间隔上限 ms
+
 // ─────────────────── cmdId 常量 ───────────────────
 
-const CMD_RANK_LIST          = 3611896190;  // CReqRankList
-const CMD_FRIEND_RECOMMEND   = 2818936274;  // CReqFriendRecommend（空 payload）
-const CMD_GET_GAME_RECORD    = 1065628532;  // CReqGetNewGameRecord
+const CMD_RANK_LIST          = 3611896190;
+const CMD_FRIEND_RECOMMEND   = 2818936274;
+const CMD_GET_GAME_RECORD    = 1065628532;
 
-// ─────────────────── 主流程 ───────────────────
+// ─────────────────── 工具函数 ───────────────────
 
-async function main() {
-    fs.mkdirSync(GAMEIDS_DIR, { recursive: true });
-
-    // 兼容单数/复数命名，支持中英文逗号，自动去空格
+function parseAccounts() {
     const rawAccounts  = process.env.SGS_ACCOUNTS  || process.env.SGS_ACCOUNT  || '';
     const rawPasswords = process.env.SGS_PASSWORDS || process.env.SGS_PASSWORD || '';
     const accounts  = rawAccounts.replace(/，/g, ',').split(',').map(s => s.trim()).filter(Boolean);
@@ -61,18 +63,26 @@ async function main() {
         console.error(`   当前: accounts=${accounts.length}, passwords=${passwords.length}`);
         process.exit(1);
     }
-    // 按当前小时轮替账号
-    const hour = new Date().getUTCHours();
-    const idx = hour % accounts.length;
-    const SGS_ACCOUNT  = accounts[idx];
-    const SGS_PASSWORD = passwords[idx];
-    console.log(`📋 使用账号 ${idx + 1}/${accounts.length}: ${SGS_ACCOUNT}  (UTC hour=${hour})`);
+    return { accounts, passwords };
+}
 
-    // ── 启动浏览器 ──────────────────────────────────────────────
-    console.log('🚀 启动无头浏览器...');
+function partitionArray(arr, n) {
+    const result = Array.from({ length: n }, () => []);
+    arr.forEach((item, i) => result[i % n].push(item));
+    return result;
+}
+
+// ═══════════════════════════════════════════════════
+//  会话建立（可复用，支持多账号并行）
+// ═══════════════════════════════════════════════════
+
+async function setupSession(account, password) {
+    const tag = `[${account}]`;
+
+    console.log(`🚀 ${tag} 启动浏览器...`);
     const browser = await puppeteer.launch({
         headless: 'new',
-        protocolTimeout: 0,   // 采集阶段单次 page.evaluate 可能跑 30+ 分钟
+        protocolTimeout: 0,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -90,7 +100,7 @@ async function main() {
     page.setDefaultTimeout(0);
     page.on('dialog', async dialog => { await dialog.dismiss(); });
 
-    // ── 反检测 ──────────────────────────────────────────────────
+    // ── 反检测 ──
     await page.setUserAgent(
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
         '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -101,9 +111,9 @@ async function main() {
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
     });
 
-    // ── 注入采集工具函数 ──────────────────────────────────────────
+    // ── 注入采集工具函数 ──
     await page.evaluateOnNewDocument(() => {
-        window.__utils = true;  // 标记已注入
+        window.__utils = true;
 
         window.encodeVarint = function(v) {
             let val = BigInt(v), bytes = [];
@@ -123,7 +133,6 @@ async function main() {
             });
         };
 
-        // 收集多个同名响应（官阶榜自动分页 5×100）
         window.collectMsgs = function(name, timeoutMs) {
             timeoutMs = timeoutMs || 20000;
             return new Promise(resolve => {
@@ -152,11 +161,6 @@ async function main() {
             });
         };
 
-        const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4, MITShenFenJingji: 4 };
-        window.modeToInt = function(m) { return typeof m === 'string' ? (MODE_STR[m] || 0) : (m || 0); };
-        window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
-
-        // 收集恰好 N 条同名响应（用于并发批量请求）
         window.collectNMsgs = function(name, n, timeoutMs) {
             timeoutMs = timeoutMs || 30000;
             return new Promise(resolve => {
@@ -176,12 +180,13 @@ async function main() {
                 cap.hooks[name].push(handler);
             });
         };
+
+        const MODE_STR = { MITHuanLeJingJi: 8, MITDouDiZhu: 36, MITBaRenJunZhengZiYou: 4, MITShenFenJingji: 4 };
+        window.modeToInt = function(m) { return typeof m === 'string' ? (MODE_STR[m] || 0) : (m || 0); };
+        window.delay = function(ms) { return new Promise(r => setTimeout(r, ms)); };
     });
 
-    // ── console.log 拦截 ────────────────────────────────────────
-    // 游戏实际的 console.log 格式（经诊断确认）：
-    //   发送: console.log('%o', '--------[  Sent  ] ID:xxx name:cmsg.XXX detail:', payload)
-    //   接收: console.log('%o', '--------[Received] ID:xxx name:', 'cmsg.CRespXXX', 'detail:', payload)
+    // ── console.log 拦截 ──
     await page.evaluateOnNewDocument(() => {
         window.__cap = { msgs: [], hooks: {} };
 
@@ -204,19 +209,16 @@ async function main() {
                 if (!header.startsWith('--------[')) return;
 
                 if (header.includes('[Received]')) {
-                    // 接收: args = ['%o', '--------[Received] ID:xxx name:', 'cmsg.XXX', 'detail:', payload]
                     const name = typeof args[2] === 'string' ? args[2] : '';
                     const payload = args[4];
                     if (name) _dispatch(name, payload);
                 } else if (header.includes('[  Sent  ]') || header.includes('[Cached]')) {
-                    // 发送: args = ['%o', '--------[  Sent  ] ID:xxx name:cmsg.XXX detail:', payload]
                     const m = header.match(/name:(cmsg\.\w+)/);
                     if (m) _dispatch(m[1], args[2]);
                 }
             } catch (_) {}
         };
 
-        // 锁住 console.log，防止游戏覆盖
         Object.defineProperty(console, 'log', {
             get: () => _hook,
             set: () => {},
@@ -224,42 +226,42 @@ async function main() {
         });
     });
 
-    // ── 登录 ────────────────────────────────────────────────────
-    console.log('🌐 打开登录页...');
+    // ── 登录 ──
+    console.log(`🌐 ${tag} 打开登录页...`);
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    console.log('✏️  填写账号密码...');
+    console.log(`✏️  ${tag} 填写账号密码...`);
     await page.waitForSelector('#SGS_login-account', { timeout: 10000 });
-    await page.type('#SGS_login-account', SGS_ACCOUNT, { delay: 50 });
-    await page.type('#SGS_login-password', SGS_PASSWORD, { delay: 50 });
+    await page.type('#SGS_login-account', account, { delay: 50 });
+    await page.type('#SGS_login-password', password, { delay: 50 });
 
     const agreed = await page.$eval('#SGS_userProto', el => el.checked);
     if (!agreed) await page.click('#SGS_userProto');
 
-    console.log('🔑 点击登录...');
+    console.log(`🔑 ${tag} 点击登录...`);
     await page.click('#SGS_login-btn');
 
-    // ── 游戏选择 ────────────────────────────────────────────────
-    console.log('🎮 等待游戏选择界面...');
+    // ── 游戏选择 ──
+    console.log(`🎮 ${tag} 等待游戏选择界面...`);
     await page.waitForSelector('#selectGame', { visible: true, timeout: 60000 }).catch(async () => {
-        console.error('❌ 登录失败');
+        console.error(`❌ ${tag} 登录失败`);
         await browser.close();
-        process.exit(1);
+        throw new Error(`login failed: ${account}`);
     });
 
-    console.log('🎮 选择三国杀：一将成名...');
+    console.log(`🎮 ${tag} 选择三国杀：一将成名...`);
     await page.evaluate(() => {
         const items = document.querySelectorAll('#oL10th .game-item');
         if (items.length >= 3) items[2].click();
     });
     await new Promise(r => setTimeout(r, 500));
 
-    console.log('⏳ 点击进入游戏...');
+    console.log(`⏳ ${tag} 点击进入游戏...`);
     await Promise.all([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
         page.click('#goInGameBtn'),
     ]).catch(async () => {
-        console.log('   导航未触发，检查 URL...');
+        console.log(`   ${tag} 导航未触发，检查 URL...`);
         await new Promise(r => setTimeout(r, 5000));
     });
     if (!page.url().startsWith(GAME_URL)) {
@@ -270,47 +272,35 @@ async function main() {
         await page.waitForFunction(
             (u) => window.location.href.startsWith(u), { timeout: 15000 }, GAME_URL,
         ).catch(async () => {
-            console.error('❌ 无法进入游戏页面');
+            console.error(`❌ ${tag} 无法进入游戏页面`);
             await browser.close();
-            process.exit(1);
+            throw new Error(`game entry failed: ${account}`);
         });
     }
 
-    // ── 处理 Laya 弹窗（canvas 坐标点击"开启"） ─────────────────
-    console.log('🔇 处理游戏内弹窗...');
+    // ── 处理 Laya 弹窗 ──
+    console.log(`🔇 ${tag} 处理游戏内弹窗...`);
     await page.waitForFunction(() => typeof Laya !== 'undefined' && Laya.stage, { timeout: 30000 });
     await new Promise(r => setTimeout(r, 5000));
 
-    await page.evaluate(() => {
-        const canvas = document.querySelector('canvas');
-        if (!canvas) return;
-        const rect = canvas.getBoundingClientRect();
-        // 图层 800x450 左下角原点, "开启" at (340, 150) → 左上角 (340, 300)
-        const clientX = rect.left + (340 / 800) * rect.width;
-        const clientY = rect.top + (300 / 450) * rect.height;
-        for (const type of ['mousedown', 'mouseup', 'click']) {
-            canvas.dispatchEvent(new MouseEvent(type, {
-                clientX, clientY, bubbles: true, cancelable: true, button: 0
-            }));
-        }
-    });
-    await new Promise(r => setTimeout(r, 2000));
-    // 再点一次
-    await page.evaluate(() => {
-        const canvas = document.querySelector('canvas');
-        if (!canvas) return;
-        const rect = canvas.getBoundingClientRect();
-        const clientX = rect.left + (340 / 800) * rect.width;
-        const clientY = rect.top + (300 / 450) * rect.height;
-        for (const type of ['mousedown', 'mouseup', 'click']) {
-            canvas.dispatchEvent(new MouseEvent(type, {
-                clientX, clientY, bubbles: true, cancelable: true, button: 0
-            }));
-        }
-    });
+    for (let i = 0; i < 2; i++) {
+        await page.evaluate(() => {
+            const canvas = document.querySelector('canvas');
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            const clientX = rect.left + (340 / 800) * rect.width;
+            const clientY = rect.top + (300 / 450) * rect.height;
+            for (const type of ['mousedown', 'mouseup', 'click']) {
+                canvas.dispatchEvent(new MouseEvent(type, {
+                    clientX, clientY, bubbles: true, cancelable: true, button: 0
+                }));
+            }
+        });
+        await new Promise(r => setTimeout(r, 2000));
+    }
 
-    // ── 等待认证 ────────────────────────────────────────────────
-    console.log('⏳ 等待游戏认证...');
+    // ── 等待认证 ──
+    console.log(`⏳ ${tag} 等待游戏认证...`);
     try {
         await page.waitForFunction(() => {
             const msgs = window.__cap?.msgs || [];
@@ -327,13 +317,13 @@ async function main() {
                 msgNames: cap ? [...new Set(cap.msgs.map(m => m.name))].slice(0, 20) : [],
             };
         });
-        console.error('❌ 认证超时 — 诊断:', JSON.stringify(diag));
+        console.error(`❌ ${tag} 认证超时 — 诊断:`, JSON.stringify(diag));
         await browser.close();
-        process.exit(1);
+        throw new Error(`auth timeout: ${account}`);
     }
-    console.log('✅ 认证成功');
+    console.log(`✅ ${tag} 认证成功`);
 
-    // ── 等待 PSC ────────────────────────────────────────────────
+    // ── 等待 PSC ──
     await page.evaluate(() => {
         return new Promise((resolve, reject) => {
             const origSend = Laya.Socket.prototype.send;
@@ -355,13 +345,18 @@ async function main() {
             setTimeout(() => reject(new Error('PSC timeout')), 15000);
         });
     });
-    console.log('✅ PSC 就绪');
+    console.log(`✅ ${tag} PSC 就绪`);
 
-    // ════════════════════════════════════════════════════════════
-    //  采集阶段
-    // ════════════════════════════════════════════════════════════
+    return { browser, page, account };
+}
 
-    // ── 每日榜单缓存检查 ────────────────────────────────────────
+// ═══════════════════════════════════════════════════
+//  采集功能函数
+// ═══════════════════════════════════════════════════
+
+// ── 排行榜采集（含每日缓存）──────────────────────
+
+async function collectBoards(page) {
     const todayStr = new Date().toISOString().slice(0, 10);
     const cachePath = path.join(CACHE_DIR, `boards_${todayStr}.json`);
     let boardCache = null;
@@ -374,9 +369,9 @@ async function main() {
     }
 
     let officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds;
-    let needCacheUpdate = !boardCache;  // 没有缓存时一定要写；有缓存但补查了也要更新
+    let needCacheUpdate = !boardCache;
 
-    // ── Step 1A：官阶榜 top 500 ─────────────────────────────
+    // Step 1A：官阶榜 top 500
     if (boardCache?.officialRank) {
         officialRankIds = boardCache.officialRank.ids;
         console.log(`\n📦 Step 1A：使用缓存（${officialRankIds.length} 人）`);
@@ -386,8 +381,8 @@ async function main() {
         const officialResult = await page.evaluate(async (CMD, delayMs) => {
             const seen = new Set();
             const payload = new Uint8Array([
-                ...encodeField(1, 20),   // rankType = RLTOfficialRank
-                ...encodeField(2, 1),    // rangeType = RLRTTotal
+                ...encodeField(1, 20),
+                ...encodeField(2, 1),
             ]);
             const resps = collectMsgs('cmsg.CRespRankList', 20000);
             window.__psc.Send(CMD, payload);
@@ -403,7 +398,7 @@ async function main() {
         console.log(`   ✅ 官阶榜 ${officialResult.pages} 页, ${officialRankIds.length} 人`);
     }
 
-    // ── Step 1B：省级排位榜（2v2, modeID=8）─────────────────
+    // Step 1B：省级排位榜（2v2, modeID=8）
     if (boardCache?.provincial) {
         provinceRankedIds = boardCache.provincial.ids;
         console.log(`\n📦 Step 1B：使用缓存（${provinceRankedIds.length} 人）`);
@@ -414,9 +409,9 @@ async function main() {
             const seen = new Set();
             for (let pid = 0; pid <= provinceMax; pid++) {
                 const payload = new Uint8Array([
-                    ...encodeField(1, 5),    // rankType = 排位
-                    ...encodeField(2, 3),    // rangeType = 省级
-                    ...encodeField(3, 8),    // modeID = 欢乐竞技(2v2)
+                    ...encodeField(1, 5),
+                    ...encodeField(2, 3),
+                    ...encodeField(3, 8),
                     ...encodeField(4, pid),
                 ]);
                 const respPromise = waitForMsg('cmsg.CRespRankList', 6000);
@@ -434,7 +429,7 @@ async function main() {
         console.log(`   ✅ 省级排位榜 ${provinceRankedIds.length} 人`);
     }
 
-    // ── Step 1B2：省级身份排位榜（身份竞技, modeID=4）───────
+    // Step 1B2：省级身份排位榜（身份竞技, modeID=4）
     if (boardCache?.provincialIdentity) {
         provinceIdentityIds = boardCache.provincialIdentity.ids;
         console.log(`\n📦 Step 1B2：使用缓存（${provinceIdentityIds.length} 人）`);
@@ -443,11 +438,10 @@ async function main() {
         needCacheUpdate = true;
         provinceIdentityIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
             const seen = new Set();
-            // 先查全服身份排位
             const globalPayload = new Uint8Array([
-                ...encodeField(1, 5),    // rankType = 排位
-                ...encodeField(2, 1),    // rangeType = 全服
-                ...encodeField(3, 4),    // modeID = 身份竞技
+                ...encodeField(1, 5),
+                ...encodeField(2, 1),
+                ...encodeField(3, 4),
             ]);
             const globalResp = waitForMsg('cmsg.CRespRankList', 10000);
             window.__psc.Send(CMD, globalPayload);
@@ -459,12 +453,11 @@ async function main() {
             } catch (_) {}
             await delay(delayMs);
 
-            // 再逐省查询
             for (let pid = 0; pid <= provinceMax; pid++) {
                 const payload = new Uint8Array([
-                    ...encodeField(1, 5),    // rankType = 排位
-                    ...encodeField(2, 3),    // rangeType = 省级
-                    ...encodeField(3, 4),    // modeID = 身份竞技
+                    ...encodeField(1, 5),
+                    ...encodeField(2, 3),
+                    ...encodeField(3, 4),
                     ...encodeField(4, pid),
                 ]);
                 const respPromise = waitForMsg('cmsg.CRespRankList', 6000);
@@ -482,7 +475,7 @@ async function main() {
         console.log(`   ✅ 省级身份排位榜 ${provinceIdentityIds.length} 人`);
     }
 
-    // ── Step 1B3：斗地主排行榜（全服月榜 top 100）──────────
+    // Step 1B3：斗地主排行榜（全服月榜 top 100）
     if (boardCache?.doudizhuRank) {
         doudizhuRankIds = boardCache.doudizhuRank.ids;
         console.log(`\n📦 Step 1B3：使用缓存（${doudizhuRankIds.length} 人）`);
@@ -492,8 +485,8 @@ async function main() {
         doudizhuRankIds = await page.evaluate(async (CMD, delayMs) => {
             const seen = new Set();
             const payload = new Uint8Array([
-                ...encodeField(1, 22),   // rankType = RLTFightLandlord
-                ...encodeField(2, 4),    // rangeType = RLRTMonth
+                ...encodeField(1, 22),
+                ...encodeField(2, 4),
             ]);
             const respPromise = waitForMsg('cmsg.CRespRankList', 10000);
             window.__psc.Send(CMD, payload);
@@ -508,7 +501,7 @@ async function main() {
         console.log(`   ✅ 斗地主排行榜 ${doudizhuRankIds.length} 人`);
     }
 
-    // ── 写入/更新每日榜单缓存 ────────────────────────────────
+    // 写入/更新每日榜单缓存
     if (needCacheUpdate) {
         fs.mkdirSync(CACHE_DIR, { recursive: true });
         fs.writeFileSync(cachePath, JSON.stringify({
@@ -522,8 +515,14 @@ async function main() {
         console.log(`\n💾 榜单缓存已${boardCache ? '更新' : '保存'}：${cachePath}`);
     }
 
-    // ── Step 1C：好友推荐"换一批"（始终执行）─────────────────────
-    console.log(`\n📊 Step 1C：好友推荐（${FRIEND_ROUNDS} 轮 × ~20 人）...`);
+    return { officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds };
+}
+
+// ── 好友推荐采集 ──────────────────────────────────
+
+async function collectFriends(page, account, rounds) {
+    const tag = `[${account}]`;
+    console.log(`📊 ${tag} 好友推荐（${rounds} 轮 × ~20 人）...`);
     const friendIds = await page.evaluate(async (CMD, rounds, delayMs) => {
         const seen = new Set();
         for (let i = 0; i < rounds; i++) {
@@ -541,22 +540,18 @@ async function main() {
             await delay(delayMs);
         }
         return [...seen];
-    }, CMD_FRIEND_RECOMMEND, FRIEND_ROUNDS, DELAY_MS);
-    console.log(`   ✅ 好友推荐 ${friendIds.length} 人`);
+    }, CMD_FRIEND_RECOMMEND, rounds, DELAY_MS);
+    console.log(`   ✅ ${tag} 好友推荐 ${friendIds.length} 人`);
+    return friendIds;
+}
 
-    // ── 合并去重 UserID ─────────────────────────────────────────
-    const allUserIdSet = new Set([...officialRankIds, ...provinceRankedIds, ...provinceIdentityIds, ...doudizhuRankIds, ...friendIds]);
-    const allUserIds = [...allUserIdSet];
-    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 斗地主${doudizhuRankIds.length} + 好友${friendIds.length})`);
+// ── GameID 批量查询 ──────────────────────────────
 
-    // ── Step 2：查询 GameID（并发批量）──────────────────────────
-    const GAME_BATCH = 100;        // 每批并发请求数
-    const BATCH_SLEEP_MIN = 2000;  // 批次间隔下限 ms
-    const BATCH_SLEEP_MAX = 5000;  // 批次间隔上限 ms
-    console.log(`\n🎮 Step 2：查询 ${allUserIds.length} 个玩家的对局记录（${GAME_BATCH} 并发, ${BATCH_SLEEP_MIN/1000}-${BATCH_SLEEP_MAX/1000}s 间隔）...`);
-    console.log(`   保留模式: [${KEEP_MODES.join(', ')}]`);
+async function queryGameIds(page, account, userIds) {
+    const tag = `[${account}]`;
+    console.log(`🎮 ${tag} 查询 ${userIds.length} 个玩家的对局记录（${GAME_BATCH} 并发）...`);
 
-    const allGameIds = await page.evaluate(async (userIds, CMD, keepModes, batchSize, sleepMin, sleepMax) => {
+    const result = await page.evaluate(async (userIds, CMD, keepModes, batchSize, sleepMin, sleepMax) => {
         const seen = new Set();
         const results = [];
         const totalBatches = Math.ceil(userIds.length / batchSize);
@@ -566,7 +561,6 @@ async function main() {
             const end = Math.min(start + batchSize, userIds.length);
             const batch = userIds.slice(start, end);
 
-            // 先注册响应收集器，再批量发送请求（WebSocket 保序）
             const respPromise = collectNMsgs(
                 'cmsg.CRespGetNewGameRecord',
                 batch.length,
@@ -577,7 +571,6 @@ async function main() {
             }
             const responses = await respPromise;
 
-            // 按发送顺序匹配响应
             for (let j = 0; j < batch.length; j++) {
                 const uid = batch[j];
                 const resp = j < responses.length ? responses[j] : null;
@@ -609,46 +602,225 @@ async function main() {
                 + ' | 已查 ' + end + '/' + userIds.length + ' (' + pct + '%)'
                 + ' | GameID: ' + seen.size);
 
-            // 随机间隔 2-5 秒
             if (b < totalBatches - 1) {
                 const sleepMs = sleepMin + Math.random() * (sleepMax - sleepMin);
                 await delay(sleepMs);
             }
         }
         return { results, totalGameIds: seen.size };
-    }, allUserIds, CMD_GET_GAME_RECORD, KEEP_MODES, GAME_BATCH, BATCH_SLEEP_MIN, BATCH_SLEEP_MAX);
+    }, userIds, CMD_GET_GAME_RECORD, KEEP_MODES, GAME_BATCH, BATCH_SLEEP_MIN, BATCH_SLEEP_MAX);
 
-    console.log(`   ✅ 共 ${allGameIds.totalGameIds} 个去重 GameID`);
+    console.log(`   ✅ ${tag} 共 ${result.totalGameIds} 个去重 GameID`);
+    return result;
+}
 
-    await browser.close();
+// ── 保存结果 ──────────────────────────────────────
 
-    // ── 保存 ────────────────────────────────────────────────────
+function saveOutput(prefix, metadata, results, totalGameIds) {
+    fs.mkdirSync(GAMEIDS_DIR, { recursive: true });
     const now     = new Date();
     const today   = now.toISOString().slice(0, 10);
-    const timeTag = now.toISOString().slice(11, 16).replace(':', '');  // HHMM
-    const outPath = path.join(GAMEIDS_DIR, `${today}_${timeTag}.json`);
+    const timeTag = now.toISOString().slice(11, 16).replace(':', '');
+    const batchId = `${prefix}_${today}_${timeTag}`;
+    const outPath = path.join(GAMEIDS_DIR, `${batchId}.json`);
     const outData = {
         metadata: {
+            ...metadata,
             date:         today,
             time:         now.toISOString(),
-            batchId:      `${today}_${timeTag}`,
-            account:      SGS_ACCOUNT,
-            sources: {
-                officialRank:        officialRankIds.length,
-                provincial:          provinceRankedIds.length,
-                provincialIdentity:  provinceIdentityIds.length,
-                friendRec:           friendIds.length,
-            },
-            totalUserIds: allUserIds.length,
-            totalGameIds: allGameIds.totalGameIds,
-            keepModes:    KEEP_MODES,
-            friendRounds: FRIEND_ROUNDS,
+            batchId,
         },
-        results: allGameIds.results,
+        results,
     };
     fs.writeFileSync(outPath, JSON.stringify(outData, null, 2), 'utf8');
     console.log(`\n💾 已保存：${outPath}`);
-    console.log(`   ${allUserIds.length} 个 UserID → ${allGameIds.totalGameIds} 个 GameID`);
+    console.log(`   ${metadata.totalUserIds} 个 UserID → ${totalGameIds} 个 GameID`);
+}
+
+// ═══════════════════════════════════════════════════
+//  模式入口
+// ═══════════════════════════════════════════════════
+
+// ── boards 模式：单账号，排行榜 + 查战绩 ─────────
+
+async function runBoards() {
+    const { accounts, passwords } = parseAccounts();
+    const hour = new Date().getUTCHours();
+    const idx = hour % accounts.length;
+    console.log(`📋 [boards] 使用账号 ${idx + 1}/${accounts.length}: ${accounts[idx]}  (UTC hour=${hour})\n`);
+
+    const { browser, page, account } = await setupSession(accounts[idx], passwords[idx]);
+
+    const { officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds } = await collectBoards(page);
+
+    const allUserIdSet = new Set([...officialRankIds, ...provinceRankedIds, ...provinceIdentityIds, ...doudizhuRankIds]);
+    const allUserIds = [...allUserIdSet];
+    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 斗地主${doudizhuRankIds.length})`);
+
+    const gameIdResult = await queryGameIds(page, account, allUserIds);
+
+    await browser.close();
+
+    saveOutput('boards', {
+        mode:         'boards',
+        account,
+        sources: {
+            officialRank:        officialRankIds.length,
+            provincial:          provinceRankedIds.length,
+            provincialIdentity:  provinceIdentityIds.length,
+            doudizhuRank:        doudizhuRankIds.length,
+        },
+        totalUserIds: allUserIds.length,
+        totalGameIds: gameIdResult.totalGameIds,
+        keepModes:    KEEP_MODES,
+    }, gameIdResult.results, gameIdResult.totalGameIds);
+}
+
+// ── friends 模式：全量账号并行，好友推荐 + 查战绩 ──
+
+async function runFriends() {
+    const { accounts, passwords } = parseAccounts();
+    console.log(`📋 [friends] ${accounts.length} 个账号并行, 每账号 ${FRIEND_ROUNDS} 轮\n`);
+
+    // 并行登录所有账号
+    const sessionResults = await Promise.allSettled(
+        accounts.map((acc, i) => setupSession(acc, passwords[i]))
+    );
+
+    const sessions = [];
+    for (let i = 0; i < sessionResults.length; i++) {
+        if (sessionResults[i].status === 'fulfilled') {
+            sessions.push(sessionResults[i].value);
+        } else {
+            console.error(`❌ 账号 ${accounts[i]} 登录失败: ${sessionResults[i].reason.message}`);
+        }
+    }
+
+    if (sessions.length === 0) {
+        console.error('❌ 所有账号登录失败');
+        process.exit(1);
+    }
+    console.log(`\n✅ ${sessions.length}/${accounts.length} 个账号登录成功\n`);
+
+    // 并行采集好友
+    const friendResults = await Promise.allSettled(
+        sessions.map(({ page, account }) => collectFriends(page, account, FRIEND_ROUNDS))
+    );
+
+    const allFriendIds = new Set();
+    for (const r of friendResults) {
+        if (r.status === 'fulfilled') {
+            r.value.forEach(id => allFriendIds.add(id));
+        }
+    }
+    const allUserIds = [...allFriendIds];
+    console.log(`\n📋 合计去重好友 UserID: ${allUserIds.length}`);
+
+    if (allUserIds.length === 0) {
+        console.log('⚠️ 没有发现任何好友，跳过 GameID 查询');
+        for (const { browser } of sessions) await browser.close().catch(() => {});
+        saveOutput('friends', {
+            mode: 'friends', accounts: sessions.map(s => s.account),
+            sources: { friendRec: 0 }, totalUserIds: 0, totalGameIds: 0,
+            keepModes: KEEP_MODES, friendRounds: FRIEND_ROUNDS,
+        }, [], 0);
+        return;
+    }
+
+    // 将 UserID 均分给各会话，并行查询 GameID
+    const parts = partitionArray(allUserIds, sessions.length);
+    const queryResults = await Promise.allSettled(
+        sessions.map(async ({ page, account }, i) => {
+            return queryGameIds(page, account, parts[i]);
+        })
+    );
+
+    // 合并结果（跨会话 GameID 去重）
+    const allResults = [];
+    const seenGids = new Set();
+    for (const r of queryResults) {
+        if (r.status === 'fulfilled') {
+            for (const entry of r.value.results) {
+                entry.gameIds = entry.gameIds.filter(g => {
+                    if (seenGids.has(g.gameId)) return false;
+                    seenGids.add(g.gameId);
+                    return true;
+                });
+                allResults.push(entry);
+            }
+        }
+    }
+
+    // 关闭所有浏览器
+    for (const { browser } of sessions) {
+        await browser.close().catch(() => {});
+    }
+
+    saveOutput('friends', {
+        mode:         'friends',
+        accounts:     sessions.map(s => s.account),
+        sources:      { friendRec: allUserIds.length },
+        totalUserIds: allUserIds.length,
+        totalGameIds: seenGids.size,
+        keepModes:    KEEP_MODES,
+        friendRounds: FRIEND_ROUNDS,
+    }, allResults, seenGids.size);
+}
+
+// ── full 模式：向后兼容，单账号跑全部 ────────────
+
+async function runFull() {
+    const { accounts, passwords } = parseAccounts();
+    const hour = new Date().getUTCHours();
+    const idx = hour % accounts.length;
+    console.log(`📋 [full] 使用账号 ${idx + 1}/${accounts.length}: ${accounts[idx]}  (UTC hour=${hour})\n`);
+
+    const { browser, page, account } = await setupSession(accounts[idx], passwords[idx]);
+
+    // 排行榜
+    const { officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds } = await collectBoards(page);
+
+    // 好友推荐
+    const friendIds = await collectFriends(page, account, FRIEND_ROUNDS);
+
+    // 合并去重
+    const allUserIdSet = new Set([...officialRankIds, ...provinceRankedIds, ...provinceIdentityIds, ...doudizhuRankIds, ...friendIds]);
+    const allUserIds = [...allUserIdSet];
+    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 斗地主${doudizhuRankIds.length} + 好友${friendIds.length})`);
+
+    // 查询 GameID
+    const gameIdResult = await queryGameIds(page, account, allUserIds);
+
+    await browser.close();
+
+    saveOutput('full', {
+        mode:         'full',
+        account,
+        sources: {
+            officialRank:        officialRankIds.length,
+            provincial:          provinceRankedIds.length,
+            provincialIdentity:  provinceIdentityIds.length,
+            doudizhuRank:        doudizhuRankIds.length,
+            friendRec:           friendIds.length,
+        },
+        totalUserIds: allUserIds.length,
+        totalGameIds: gameIdResult.totalGameIds,
+        keepModes:    KEEP_MODES,
+        friendRounds: FRIEND_ROUNDS,
+    }, gameIdResult.results, gameIdResult.totalGameIds);
+}
+
+// ═══════════════════════════════════════════════════
+//  主入口
+// ═══════════════════════════════════════════════════
+
+async function main() {
+    fs.mkdirSync(GAMEIDS_DIR, { recursive: true });
+    console.log(`🔧 运行模式: ${MODE}\n`);
+
+    if (MODE === 'boards')       await runBoards();
+    else if (MODE === 'friends') await runFriends();
+    else                         await runFull();
 }
 
 main().catch(err => {
