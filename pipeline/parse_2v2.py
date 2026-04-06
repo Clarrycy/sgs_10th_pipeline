@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import csv
+import shutil
 import argparse
 from pathlib import Path
 
@@ -47,10 +48,11 @@ DISPLAY_B = {0: 2, 1: 3, 2: 4, 3: 1}
 
 FLUSH_EVERY = 500
 
-ROOT        = Path(__file__).resolve().parent.parent
-INPUT_DIR   = ROOT / 'data' / 'replays' / '2v2'
-INDEXES_DIR = ROOT / 'data' / 'indexes'
-INDEX_FILE  = INDEXES_DIR / 'index_ranked.json'
+ROOT         = Path(__file__).resolve().parent.parent
+INPUT_DIR    = ROOT / 'data' / 'replays' / '2v2'
+INDEXES_DIR  = ROOT / 'data' / 'indexes'
+INDEX_FILE   = INDEXES_DIR / 'index_ranked.json'
+ANOMALY_DIR  = ROOT / 'data' / 'replays' / '2v2_anomaly'  # 异常对局留存
 
 # ─────────────────── 座次 Pattern + Elo 提取 ───────────────────
 
@@ -193,6 +195,7 @@ def process(quiet=False):
 
     buf = []
     total = skipped_dup = skipped_other = no_pattern = 0
+    no_pattern_ids = []
 
     def flush():
         nonlocal buf
@@ -228,6 +231,10 @@ def process(quiet=False):
 
             if rows and rows[0]['camp'] == '未知':
                 no_pattern += 1
+                no_pattern_ids.append(gid_str)
+                # 复制到异常目录留存
+                ANOMALY_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fpath, ANOMALY_DIR / fpath.name)
 
             buf.extend(rows)
             total += 1
@@ -245,7 +252,8 @@ def process(quiet=False):
     if skipped_other:
         print(f'⚠️  跳过无效/非2v2 {skipped_other} 个')
     if no_pattern:
-        print(f'⚠️  {no_pattern} 局未能识别座次 Pattern')
+        print(f'⚠️  {no_pattern} 局未能识别座次 Pattern：{", ".join(no_pattern_ids)}')
+        print(f'   已复制到 {ANOMALY_DIR}')
     print(f'💾 {DB_PATH}')
 
 
