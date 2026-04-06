@@ -51,7 +51,7 @@ jobs:
           SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS || secrets.SGS_PASSWORD }}
           KEEP_MODES:     '4,8,36'
           PROVINCE_MAX:   '33'
-          FRIEND_ROUNDS:  '100'
+          FRIEND_ROUNDS:  '300'
           REQUEST_DELAY:  '300'
         run: node collect/collect.js
 
