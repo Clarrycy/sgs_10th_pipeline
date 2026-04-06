@@ -2,9 +2,9 @@ name: Daily Pipeline
 
 on:
   schedule:
-    # 每 3 小时跑一次（单次执行 ~2h40min，留余量避免重叠）
+    # 每 2 小时跑一次
     # 账号按当前小时对账号数取模轮替，支持任意数量账号
-    - cron: '0 */3 * * *'
+    - cron: '0 */2 * * *'
   workflow_dispatch:        # 支持手动触发
 
 concurrency:
