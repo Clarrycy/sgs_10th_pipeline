@@ -7,10 +7,6 @@ on:
     - cron: '0 */2 * * *'
   workflow_dispatch:        # 支持手动触发
 
-concurrency:
-  group: pipeline           # 同时只允许一个 pipeline 运行
-  cancel-in-progress: false # 不取消正在跑的，排队等它跑完（保证数据完整性）
-
 jobs:
   pipeline:
     runs-on: ubuntu-latest
