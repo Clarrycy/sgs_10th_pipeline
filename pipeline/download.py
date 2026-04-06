@@ -223,12 +223,27 @@ INDEX_MODE_FILES = {
 }
 
 
-def load_gameids_from_indexes():
-    """从 per-mode index JSON 读取 replayDownloaded=False 的 GameID。
+def load_gameids_from_indexes(reparse=False):
+    """从 per-mode index JSON 读取待下载的 GameID。
     跳过 identity (mode 4)。返回 list[str]。
+
+    reparse=False: 只返回 replayDownloaded=False 的（正常增量）
+    reparse=True:  返回 replayDownloaded=True 但 DB 中缺失的（补回丢失数据）
     """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+
     result = []
     seen = set()
+
+    if reparse:
+        from db import get_conn, existing_game_ids
+        conn = get_conn()
+        db_2v2 = existing_game_ids(conn, 'ranked_2v2')
+        db_ddz = existing_game_ids(conn, 'doudizhu')
+        db_ids = db_2v2 | db_ddz
+        conn.close()
+        print(f'  📋 DB 已有: ranked_2v2={len(db_2v2)}, doudizhu={len(db_ddz)}')
 
     for mode, fname in INDEX_MODE_FILES.items():
         fp = INDEXES_DIR / fname
@@ -239,16 +254,26 @@ def load_gameids_from_indexes():
 
         count = 0
         for gid, entry in data.get('games', {}).items():
-            if entry.get('replayDownloaded'):
-                continue
+            if reparse:
+                # 只要索引里标记已下载、但 DB 中没有的
+                if not entry.get('replayDownloaded'):
+                    continue
+                if gid in db_ids:
+                    continue
+            else:
+                if entry.get('replayDownloaded'):
+                    continue
+
             if gid not in seen:
                 seen.add(gid)
                 result.append(gid)
                 count += 1
 
-        print(f'  📋 {fname}: {count} 个待下载')
+        label = '待补回' if reparse else '待下载'
+        print(f'  📋 {fname}: {count} 个{label}')
 
-    print(f'  合计: {len(result)} 个 GameID（从索引）')
+    label = '补回' if reparse else '从索引'
+    print(f'  合计: {len(result)} 个 GameID（{label}）')
     return result
 
 
@@ -410,6 +435,8 @@ def main():
     ap.add_argument('--cleanup', action='store_true', help='清理旧 .sgs 文件（需搭配 --days）')
     ap.add_argument('--use-indexes', action='store_true',
                     help='从 per-mode index JSON 读取待下载列表（跳过身份 mode 4）')
+    ap.add_argument('--reparse', action='store_true',
+                    help='补回模式：重新下载索引中已标记但 DB 中缺失的 GameID')
     args = ap.parse_args()
 
     # 清理模式
@@ -428,7 +455,10 @@ def main():
         print(f'🎯 模式过滤：{allowed_modes}')
 
     # 加载所有 GameID
-    if use_indexes:
+    if args.reparse:
+        print('🔄 补回模式：查找索引中已下载但 DB 中缺失的 GameID...')
+        all_ids = load_gameids_from_indexes(reparse=True)
+    elif use_indexes:
         print('📋 索引模式：从 per-mode index JSON 读取...')
         all_ids = load_gameids_from_indexes()
     else:

@@ -58,6 +58,9 @@ jobs:
       - name: Download replays
         run: python pipeline/download.py --use-indexes --days=7
 
+      - name: Reparse missing replays
+        run: python pipeline/download.py --reparse --days=7
+
       - name: Parse 2v2
         run: python pipeline/parse_2v2.py --quiet --update-index
 
@@ -70,6 +73,9 @@ jobs:
           SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS || secrets.SGS_PASSWORD }}
           REQUEST_DELAY:  '300'
         run: python pipeline/enrich_ranks.py
+
+      - name: Export DB to CSV
+        run: python pipeline/export_csv.py
 
       - name: Push results to R2
         env:
