@@ -79,12 +79,12 @@ def get_client():
 def push(include_replays=False):
     client, bucket = get_client()
 
-    # 上传 data/output/ (CSV + SQLite)
+    # 上传 data/output/ (CSV)
     output_files = list(OUTPUT_DIR.glob('*'))
-    data_files = [f for f in output_files if f.suffix in ('.csv', '.db') and f.is_file()]
-    # 也上传项目根 data/ 下的 sgs.db
+    data_files = [f for f in output_files if f.suffix == '.csv' and f.is_file()]
+    # sgs.db 统一从 data/sgs.db 上传（db.py 写入路径），避免与 data/output/sgs.db 冲突
     db_file = ROOT / 'data' / 'sgs.db'
-    if db_file.is_file() and db_file not in data_files:
+    if db_file.is_file():
         data_files.append(db_file)
     print(f'📤 上传 data/output/ ({len(data_files)} 个文件)...')
     for local in data_files:
@@ -172,6 +172,16 @@ def pull():
         if count == 0:
             print(f'  （R2 上没有 {label}/ 文件）')
         total += count
+
+    # output/sgs.db 下载到 data/output/sgs.db，但 db.py 实际使用 data/sgs.db
+    # 把它复制到正确位置，确保 pipeline 每次都基于历史数据继续累积
+    import shutil
+    output_db = OUTPUT_DIR / 'sgs.db'
+    actual_db = ROOT / 'data' / 'sgs.db'
+    if output_db.is_file():
+        shutil.copy2(str(output_db), str(actual_db))
+        size_mb = output_db.stat().st_size / 1024 / 1024
+        print(f'  📋 sgs.db 同步到 data/sgs.db ({size_mb:.1f} MB)')
 
     if total > 0:
         print(f'✅ 拉取完成（共 {total} 个文件）')
