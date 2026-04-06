@@ -49,10 +49,12 @@ async function main() {
         console.error('❌ 缺少环境变量 SGS_ACCOUNTS / SGS_PASSWORDS');
         process.exit(1);
     }
-    // 固定使用账号列表中的最后一个（避免和 collect.js 的按时轮替冲突）
-    const SGS_ACCOUNT  = accounts[accounts.length - 1];
-    const SGS_PASSWORD = passwords[passwords.length - 1];
-    console.log(`📋 使用账号：${SGS_ACCOUNT}`);
+    // 按当前小时 +1 偏移轮替（与 collect.js 错开，减少会话冲突）
+    const hour = new Date().getUTCHours();
+    const idx = (hour + 1) % accounts.length;
+    const SGS_ACCOUNT  = accounts[idx];
+    const SGS_PASSWORD = passwords[idx];
+    console.log(`📋 使用账号 ${idx + 1}/${accounts.length}：${SGS_ACCOUNT}`);
 
     // ── 启动浏览器 ──────────────────────────────────────────────
     const browser = await puppeteer.launch({
