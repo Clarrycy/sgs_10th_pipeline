@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS doudizhu (
     candidates  TEXT,
     swapped_out TEXT,
     swapped_in  TEXT,
+    rank_score  INTEGER,
     PRIMARY KEY (game_id, seat)
 );
 
@@ -91,13 +92,24 @@ CREATE INDEX IF NOT EXISTS idx_war_mode    ON war_records (mode_id);
 # ─────────────────── 连接 ───────────────────
 
 def get_conn():
-    """获取 SQLite 连接（自动建表）。"""
+    """获取 SQLite 连接（自动建表 + 迁移）。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn):
+    """增量迁移：为已有表补充新列。"""
+    # doudizhu.rank_score — 斗地主积分（2026-04-06 新增）
+    try:
+        conn.execute("SELECT rank_score FROM doudizhu LIMIT 0")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE doudizhu ADD COLUMN rank_score INTEGER")
+        conn.commit()
 
 
 # ─────────────────── 武将映射 ───────────────────
@@ -154,11 +166,13 @@ def insert_doudizhu(conn, rows):
     conn.executemany(
         """INSERT OR IGNORE INTO doudizhu
            (game_id, game_time, seat, player_name, user_id, rank_name,
-            general_id, camp, result, candidates, swapped_out, swapped_in)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            general_id, camp, result, candidates, swapped_out, swapped_in,
+            rank_score)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [(r['game_id'], r['game_time'], r['seat'], r['player_name'],
           r['user_id'], r['rank_name'], r['general_id'], r['camp'],
-          r['result'], r['candidates'], r['swapped_out'], r['swapped_in'])
+          r['result'], r['candidates'], r['swapped_out'], r['swapped_in'],
+          r.get('rank_score'))
          for r in rows],
     )
 

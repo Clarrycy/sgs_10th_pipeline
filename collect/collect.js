@@ -348,16 +348,17 @@ async function main() {
     if (fs.existsSync(cachePath)) {
         boardCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
         console.log(`\n📦 榜单缓存命中：${cachePath}`);
-        console.log(`   官阶 ${boardCache.officialRank.count} 人 | 省级排位 ${boardCache.provincial.count} 人 | 省级身份 ${boardCache.provincialIdentity.count} 人`);
+        console.log(`   官阶 ${boardCache.officialRank.count} 人 | 省级排位 ${boardCache.provincial.count} 人 | 省级身份 ${boardCache.provincialIdentity.count} 人 | 斗地主 ${boardCache.doudizhuRank?.count || 0} 人`);
     }
 
-    let officialRankIds, provinceRankedIds, provinceIdentityIds;
+    let officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds;
 
     if (boardCache) {
-        // ── 使用缓存，跳过 Step 1A + 1B + 1B2 ─────────────────
-        officialRankIds   = boardCache.officialRank.ids;
-        provinceRankedIds = boardCache.provincial.ids;
+        // ── 使用缓存，跳过 Step 1A + 1B + 1B2 + 1B3 ──────────
+        officialRankIds     = boardCache.officialRank.ids;
+        provinceRankedIds   = boardCache.provincial.ids;
         provinceIdentityIds = boardCache.provincialIdentity.ids;
+        doudizhuRankIds     = boardCache.doudizhuRank?.ids || [];
     } else {
         // ── Step 1A：官阶榜 top 500 ─────────────────────────────
         console.log('\n📊 Step 1A：官阶榜 top 500...');
@@ -447,6 +448,26 @@ async function main() {
         }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
         console.log(`   ✅ 省级身份排位榜 ${provinceIdentityIds.length} 人`);
 
+        // ── Step 1B3：斗地主排行榜（全服月榜 top 100）──────────
+        console.log(`\n📊 Step 1B3：斗地主排行榜（全服月榜）...`);
+        doudizhuRankIds = await page.evaluate(async (CMD, delayMs) => {
+            const seen = new Set();
+            const payload = new Uint8Array([
+                ...encodeField(1, 22),   // rankType = RLTFightLandlord
+                ...encodeField(2, 4),    // rangeType = RLRTMonth
+            ]);
+            const respPromise = waitForMsg('cmsg.CRespRankList', 10000);
+            window.__psc.Send(CMD, payload);
+            try {
+                const resp = await respPromise;
+                for (const u of (resp.payload?.rankList || [])) {
+                    if (u.userID) seen.add(String(u.userID));
+                }
+            } catch (_) {}
+            return [...seen];
+        }, CMD_RANK_LIST, DELAY_MS);
+        console.log(`   ✅ 斗地主排行榜 ${doudizhuRankIds.length} 人`);
+
         // ── 写入每日榜单缓存 ────────────────────────────────────
         fs.mkdirSync(CACHE_DIR, { recursive: true });
         fs.writeFileSync(cachePath, JSON.stringify({
@@ -455,6 +476,7 @@ async function main() {
             officialRank:        { count: officialRankIds.length, ids: officialRankIds },
             provincial:          { count: provinceRankedIds.length, ids: provinceRankedIds },
             provincialIdentity:  { count: provinceIdentityIds.length, ids: provinceIdentityIds },
+            doudizhuRank:        { count: doudizhuRankIds.length, ids: doudizhuRankIds },
         }, null, 2), 'utf8');
         console.log(`\n💾 榜单缓存已保存：${cachePath}`);
     }
@@ -482,9 +504,9 @@ async function main() {
     console.log(`   ✅ 好友推荐 ${friendIds.length} 人`);
 
     // ── 合并去重 UserID ─────────────────────────────────────────
-    const allUserIdSet = new Set([...officialRankIds, ...provinceRankedIds, ...provinceIdentityIds, ...friendIds]);
+    const allUserIdSet = new Set([...officialRankIds, ...provinceRankedIds, ...provinceIdentityIds, ...doudizhuRankIds, ...friendIds]);
     const allUserIds = [...allUserIdSet];
-    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 好友${friendIds.length})`);
+    console.log(`\n📋 合计去重 UserID: ${allUserIds.length} (官阶${officialRankIds.length} + 省级排位${provinceRankedIds.length} + 省级身份${provinceIdentityIds.length} + 斗地主${doudizhuRankIds.length} + 好友${friendIds.length})`);
 
     // ── Step 2：查询 GameID ─────────────────────────────────────
     console.log(`\n🎮 Step 2：查询 ${allUserIds.length} 个玩家的对局记录...`);

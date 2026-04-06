@@ -71,6 +71,7 @@ def build_rows(header, picks, candidates, results, mapping, landlord_seat, swaps
             'candidates':  ','.join(str(c) for c in candidates.get(rs, [])),
             'swapped_out': ','.join(str(old) for old, _ in seat_swaps),
             'swapped_in':  ','.join(str(new) for _, new in seat_swaps),
+            'rank_score':  p.get('rank_score'),
         })
     return rows
 
