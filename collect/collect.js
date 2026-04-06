@@ -348,20 +348,20 @@ async function main() {
     if (fs.existsSync(cachePath)) {
         boardCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
         console.log(`\n📦 榜单缓存命中：${cachePath}`);
-        console.log(`   官阶 ${boardCache.officialRank.count} 人 | 省级排位 ${boardCache.provincial.count} 人 | 省级身份 ${boardCache.provincialIdentity.count} 人 | 斗地主 ${boardCache.doudizhuRank?.count || 0} 人`);
+        const bc = boardCache;
+        console.log(`   官阶 ${bc.officialRank?.count || 0} 人 | 省级排位 ${bc.provincial?.count || 0} 人 | 省级身份 ${bc.provincialIdentity?.count || 0} 人 | 斗地主 ${bc.doudizhuRank?.count || 0} 人`);
     }
 
     let officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds;
+    let needCacheUpdate = !boardCache;  // 没有缓存时一定要写；有缓存但补查了也要更新
 
-    if (boardCache) {
-        // ── 使用缓存，跳过 Step 1A + 1B + 1B2 + 1B3 ──────────
-        officialRankIds     = boardCache.officialRank.ids;
-        provinceRankedIds   = boardCache.provincial.ids;
-        provinceIdentityIds = boardCache.provincialIdentity.ids;
-        doudizhuRankIds     = boardCache.doudizhuRank?.ids || [];
+    // ── Step 1A：官阶榜 top 500 ─────────────────────────────
+    if (boardCache?.officialRank) {
+        officialRankIds = boardCache.officialRank.ids;
+        console.log(`\n📦 Step 1A：使用缓存（${officialRankIds.length} 人）`);
     } else {
-        // ── Step 1A：官阶榜 top 500 ─────────────────────────────
         console.log('\n📊 Step 1A：官阶榜 top 500...');
+        needCacheUpdate = true;
         const officialResult = await page.evaluate(async (CMD, delayMs) => {
             const seen = new Set();
             const payload = new Uint8Array([
@@ -380,9 +380,15 @@ async function main() {
         }, CMD_RANK_LIST, DELAY_MS);
         officialRankIds = officialResult.ids;
         console.log(`   ✅ 官阶榜 ${officialResult.pages} 页, ${officialRankIds.length} 人`);
+    }
 
-        // ── Step 1B：省级排位榜（2v2, modeID=8）─────────────────
+    // ── Step 1B：省级排位榜（2v2, modeID=8）─────────────────
+    if (boardCache?.provincial) {
+        provinceRankedIds = boardCache.provincial.ids;
+        console.log(`\n📦 Step 1B：使用缓存（${provinceRankedIds.length} 人）`);
+    } else {
         console.log(`\n📊 Step 1B：省级排位榜（${PROVINCE_MAX + 1} 个省份, modeID=8）...`);
+        needCacheUpdate = true;
         provinceRankedIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
             const seen = new Set();
             for (let pid = 0; pid <= provinceMax; pid++) {
@@ -405,9 +411,15 @@ async function main() {
             return [...seen];
         }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
         console.log(`   ✅ 省级排位榜 ${provinceRankedIds.length} 人`);
+    }
 
-        // ── Step 1B2：省级身份排位榜（身份竞技, modeID=4）───────
+    // ── Step 1B2：省级身份排位榜（身份竞技, modeID=4）───────
+    if (boardCache?.provincialIdentity) {
+        provinceIdentityIds = boardCache.provincialIdentity.ids;
+        console.log(`\n📦 Step 1B2：使用缓存（${provinceIdentityIds.length} 人）`);
+    } else {
         console.log(`\n📊 Step 1B2：省级身份排位榜（${PROVINCE_MAX + 1} 个省份, modeID=4）...`);
+        needCacheUpdate = true;
         provinceIdentityIds = await page.evaluate(async (CMD, provinceMax, delayMs) => {
             const seen = new Set();
             // 先查全服身份排位
@@ -447,9 +459,15 @@ async function main() {
             return [...seen];
         }, CMD_RANK_LIST, PROVINCE_MAX, DELAY_MS);
         console.log(`   ✅ 省级身份排位榜 ${provinceIdentityIds.length} 人`);
+    }
 
-        // ── Step 1B3：斗地主排行榜（全服月榜 top 100）──────────
+    // ── Step 1B3：斗地主排行榜（全服月榜 top 100）──────────
+    if (boardCache?.doudizhuRank) {
+        doudizhuRankIds = boardCache.doudizhuRank.ids;
+        console.log(`\n📦 Step 1B3：使用缓存（${doudizhuRankIds.length} 人）`);
+    } else {
         console.log(`\n📊 Step 1B3：斗地主排行榜（全服月榜）...`);
+        needCacheUpdate = true;
         doudizhuRankIds = await page.evaluate(async (CMD, delayMs) => {
             const seen = new Set();
             const payload = new Uint8Array([
@@ -467,8 +485,10 @@ async function main() {
             return [...seen];
         }, CMD_RANK_LIST, DELAY_MS);
         console.log(`   ✅ 斗地主排行榜 ${doudizhuRankIds.length} 人`);
+    }
 
-        // ── 写入每日榜单缓存 ────────────────────────────────────
+    // ── 写入/更新每日榜单缓存 ────────────────────────────────
+    if (needCacheUpdate) {
         fs.mkdirSync(CACHE_DIR, { recursive: true });
         fs.writeFileSync(cachePath, JSON.stringify({
             date: todayStr,
@@ -478,7 +498,7 @@ async function main() {
             provincialIdentity:  { count: provinceIdentityIds.length, ids: provinceIdentityIds },
             doudizhuRank:        { count: doudizhuRankIds.length, ids: doudizhuRankIds },
         }, null, 2), 'utf8');
-        console.log(`\n💾 榜单缓存已保存：${cachePath}`);
+        console.log(`\n💾 榜单缓存已${boardCache ? '更新' : '保存'}：${cachePath}`);
     }
 
     // ── Step 1C：好友推荐"换一批"（始终执行）─────────────────────
