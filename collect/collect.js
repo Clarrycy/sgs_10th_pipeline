@@ -649,7 +649,25 @@ async function runBoards() {
     const idx = hour % accounts.length;
     console.log(`📋 [boards] 使用账号 ${idx + 1}/${accounts.length}: ${accounts[idx]}  (UTC hour=${hour})\n`);
 
-    const { browser, page, account } = await setupSession(accounts[idx], passwords[idx]);
+    // 认证失败时自动重试（换下一个账号）
+    let browser, page, account;
+    for (let attempt = 0; attempt < accounts.length; attempt++) {
+        const tryIdx = (idx + attempt) % accounts.length;
+        try {
+            ({ browser, page, account } = await setupSession(accounts[tryIdx], passwords[tryIdx]));
+            break;
+        } catch (err) {
+            console.error(`❌ 账号 ${accounts[tryIdx]} 登录失败: ${err.message}`);
+            if (attempt < accounts.length - 1) {
+                console.log(`⏳ 等待 10 秒后尝试下一个账号...`);
+                await new Promise(r => setTimeout(r, 10000));
+            }
+        }
+    }
+    if (!page) {
+        console.error('❌ 所有账号登录失败');
+        process.exit(1);
+    }
 
     const { officialRankIds, provinceRankedIds, provinceIdentityIds, doudizhuRankIds } = await collectBoards(page);
 
@@ -683,14 +701,24 @@ async function runFriends() {
     console.log(`📋 [friends] ${accounts.length} 个账号串行登录 → 并行采集, 每账号 ${FRIEND_ROUNDS} 轮\n`);
 
     // 串行登录（同 IP 并发 WebSocket 会被服务器限流，逐个等认证通过）
+    // 认证失败时自动重试一次（服务器偶尔不回 CRespAuth）
+    const MAX_RETRIES = 2;
     const sessions = [];
     for (let i = 0; i < accounts.length; i++) {
-        try {
-            const session = await setupSession(accounts[i], passwords[i]);
-            sessions.push(session);
-        } catch (err) {
-            console.error(`❌ 账号 ${accounts[i]} 登录失败: ${err.message}`);
+        let session = null;
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                session = await setupSession(accounts[i], passwords[i]);
+                break;
+            } catch (err) {
+                console.error(`❌ 账号 ${accounts[i]} 第 ${attempt}/${MAX_RETRIES} 次登录失败: ${err.message}`);
+                if (attempt < MAX_RETRIES) {
+                    console.log(`⏳ 等待 10 秒后重试...`);
+                    await new Promise(r => setTimeout(r, 10000));
+                }
+            }
         }
+        if (session) sessions.push(session);
     }
 
     if (sessions.length === 0) {
