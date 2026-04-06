@@ -17,6 +17,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from db import get_conn, insert_war_records
+
 ROOT = Path(__file__).resolve().parent.parent
 GAMEIDS_DIR = ROOT / 'data' / 'gameids'
 INDEXES_DIR = ROOT / 'data' / 'indexes'
@@ -143,10 +146,13 @@ def load_batch_files(processed_set):
 
 def merge_batch(batch, indexes):
     """将一个 batch 中的 games 按 modeId 分发到对应 index。
-    返回 per_mode_user_games: {mode: {userId: [gameId, ...]}}
+    返回 (per_mode_user_games, war_rows)
+      per_mode_user_games: {mode: {userId: [gameId, ...]}}
+      war_rows: list of war_record dicts for SQLite
     """
     batch_id = batch['_batchId']
     per_mode_user_games = {}
+    war_rows = []
 
     for entry in batch.get('results', []):
         user_id = str(entry.get('userId', ''))
@@ -165,12 +171,10 @@ def merge_batch(batch, indexes):
             idx = indexes[mode_id]
 
             if game_id in idx['games']:
-                # 已有 → 追加 collectedFrom（去重）
                 existing = idx['games'][game_id]
                 if user_id not in existing['collectedFrom']:
                     existing['collectedFrom'].append(user_id)
             else:
-                # 新 game → 创建 entry
                 idx['games'][game_id] = {
                     'gameId': game_id,
                     'modeId': mode_id,
@@ -182,12 +186,26 @@ def merge_batch(batch, indexes):
                     'parsed': None,
                 }
 
-            # 记录 per_mode_user_games 用于 session 检测
+            # 战绩元数据 → war_records（新格式 batch 才有这些字段）
+            war_rows.append({
+                'game_id':      game_id,
+                'user_id':      user_id,
+                'mode_id':      mode_id,
+                'game_time':    game_obj.get('gameTime', 0),
+                'result':       game_obj.get('result', ''),
+                'is_mvp':       1 if game_obj.get('isMvp') else 0,
+                'is_escape':    1 if game_obj.get('isEscape') else 0,
+                'figure':       game_obj.get('figure', 0),
+                'general_id':   game_obj.get('generalId', 0),
+                'score_change': game_obj.get('scoreChange', 0),
+                'batch_id':     batch_id,
+            })
+
             per_mode_user_games.setdefault(mode_id, {}).setdefault(user_id, []).append(game_id)
 
         idx['lastBatchId'] = batch_id
 
-    return per_mode_user_games
+    return per_mode_user_games, war_rows
 
 
 # ─── Union-Find ────────────────────────────────────────────────
@@ -346,13 +364,17 @@ def main():
     # 加载现有 indexes
     indexes = {mode: load_index(mode) for mode in MODE_CONFIG}
 
+    # SQLite: 收集所有 war_record 行
+    all_war_rows = []
+
     # 按时间顺序处理每个 batch
     for batch in batches:
         batch_id = batch['_batchId']
         log(f'\n  ▶ 处理 batch: {batch["_filename"]} (batchId={batch_id})')
 
-        # Merge：分流到 indexes
-        per_mode_user_games = merge_batch(batch, indexes)
+        # Merge：分流到 indexes + 收集 war_records
+        per_mode_user_games, war_rows = merge_batch(batch, indexes)
+        all_war_rows.extend(war_rows)
 
         # Session 检测
         new_per_mode = {}
@@ -373,7 +395,7 @@ def main():
         state['processedBatches'].append(batch_id)
         state['perMode'] = new_per_mode
 
-    # 保存
+    # 保存 JSON indexes
     for mode in MODE_CONFIG:
         save_index(mode, indexes[mode])
         total = len(indexes[mode]['games'])
@@ -381,6 +403,15 @@ def main():
 
     save_session_state(state)
     log(f'\n  💾 session_state.json: {len(state["processedBatches"])} batches processed')
+
+    # 保存 war_records 到 SQLite
+    if all_war_rows:
+        conn = get_conn()
+        insert_war_records(conn, all_war_rows)
+        conn.commit()
+        conn.close()
+        log(f'\n  💾 sgs.db: {len(all_war_rows)} 条战绩写入 war_records')
+
     log('\n✅ merge_indexes 完成')
 
 

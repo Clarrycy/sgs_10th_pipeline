@@ -505,7 +505,17 @@ async function main() {
                 const records = resp.payload?.recordData?.saveRecordList || [];
                 const gameIds = records
                     .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
-                    .map(r => ({ gameId: String(r.gameID), modeId: modeToInt(r.modeID) }))
+                    .map(r => ({
+                        gameId:      String(r.gameID),
+                        modeId:      modeToInt(r.modeID),
+                        gameTime:    r.gameStartTime || 0,
+                        result:      r.gameResult || '',
+                        isMvp:       !!r.isMvp,
+                        isEscape:    !!r.isEscape,
+                        figure:      r.figure || 0,
+                        generalId:   (r.usingCharacters || [])[0] || 0,
+                        scoreChange: r.scoreChange || 0,
+                    }))
                     .filter(o => o.gameId && o.gameId !== '0' && !seen.has(o.gameId));
                 for (const o of gameIds) seen.add(o.gameId);
                 results.push({ userId: uid, gameIds });

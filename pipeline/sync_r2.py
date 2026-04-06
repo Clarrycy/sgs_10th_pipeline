@@ -79,11 +79,15 @@ def get_client():
 def push(include_replays=False):
     client, bucket = get_client()
 
-    # 上传 data/output/
+    # 上传 data/output/ (CSV + SQLite)
     output_files = list(OUTPUT_DIR.glob('*'))
-    csv_files = [f for f in output_files if f.suffix in ('.csv',) and f.is_file()]
-    print(f'📤 上传 data/output/ ({len(csv_files)} 个文件)...')
-    for local in csv_files:
+    data_files = [f for f in output_files if f.suffix in ('.csv', '.db') and f.is_file()]
+    # 也上传项目根 data/ 下的 sgs.db
+    db_file = ROOT / 'data' / 'sgs.db'
+    if db_file.is_file() and db_file not in data_files:
+        data_files.append(db_file)
+    print(f'📤 上传 data/output/ ({len(data_files)} 个文件)...')
+    for local in data_files:
         key = f'output/{local.name}'
         _upload(client, bucket, local, key)
 

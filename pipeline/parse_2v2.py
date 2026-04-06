@@ -19,10 +19,8 @@ SGS 2v2 排位录像解析（mode=8，4人）
 """
 
 import json
-
 import os
 import sys
-import glob
 import csv
 import argparse
 from pathlib import Path
@@ -33,6 +31,7 @@ from common import (
     parse_events, load_mapping, propagate_results, gname,
     RESULT_MAP, gameid_to_time,
 )
+from db import get_conn, refresh_generals, insert_ranked_2v2, existing_game_ids, DB_PATH
 
 # ─────────────────── 常量 ───────────────────
 
@@ -46,17 +45,10 @@ MSG_ELO      = 0x000335A7   # Elo 匹配分事件
 DISPLAY_A = {0: 4, 1: 1, 2: 2, 3: 3}
 DISPLAY_B = {0: 2, 1: 3, 2: 4, 3: 1}
 
-HEADERS = [
-    'GameID', '对局时间', '座位', '玩家昵称', 'UserID', '官阶',
-    '选将', '阵营', '胜负', '出框武将', '官阶积分', 'Elo',
-]
-
 FLUSH_EVERY = 500
 
 ROOT        = Path(__file__).resolve().parent.parent
 INPUT_DIR   = ROOT / 'data' / 'replays' / '2v2'
-OUTPUT_DIR  = ROOT / 'data' / 'output'
-OUT_PATH    = OUTPUT_DIR / 'parsed_2v2.csv'
 INDEXES_DIR = ROOT / 'data' / 'indexes'
 INDEX_FILE  = INDEXES_DIR / 'index_ranked.json'
 
@@ -130,21 +122,21 @@ def build_rows(data, header, picks, candidates, results, mapping):
         p    = seat_player.get(proto_seat, {})
         disp = display_map[proto_seat]
         rows.append({
-            'GameID':   gid_str,
-            '对局时间': game_time,
-            '座位':     str(disp),
-            '玩家昵称': p.get('name', '') or f'逃跑_{str(p.get("pid","0000"))[-4:]}',
-            'UserID':   str(p.get('pid', '')),
-            '官阶':     _rank_name(p.get('rank_code')),
-            '选将':     gname(mapping, picks.get(proto_seat)),
-            '阵营':     camp[proto_seat],
-            '胜负':     RESULT_MAP.get(results.get(proto_seat), ''),
-            '出框武将': ', '.join(gname(mapping, c) for c in candidates.get(proto_seat, [])),
-            '官阶积分': str(p.get('rank_score', '')) if p.get('rank_score') is not None else '',
-            'Elo':      str(elo.get(proto_seat, '')),
+            'game_id':     gid_str,
+            'game_time':   game_time,
+            'seat':        disp,
+            'player_name': p.get('name', '') or f'逃跑_{str(p.get("pid","0000"))[-4:]}',
+            'user_id':     str(p.get('pid', '')),
+            'rank_name':   _rank_name(p.get('rank_code')),
+            'general_id':  picks.get(proto_seat),
+            'camp':        camp[proto_seat],
+            'result':      RESULT_MAP.get(results.get(proto_seat), ''),
+            'candidates':  ','.join(str(c) for c in candidates.get(proto_seat, [])),
+            'rank_score':  p.get('rank_score'),
+            'elo':         elo.get(proto_seat),
         })
 
-    rows.sort(key=lambda r: int(r['座位']))
+    rows.sort(key=lambda r: r['seat'])
     return rows
 
 
@@ -152,85 +144,34 @@ def _rank_name(code):
     from common import rank_name
     return rank_name(code)
 
-# ─────────────────── 单场解析（用于 index 回写） ───────────────────
-
-def parse_single_game(sgs_path, mapping):
-    """解析单个 .sgs 文件，返回 parsed dict（用于嵌入 index JSON），解析失败返回 None。"""
-    try:
-        with open(sgs_path, 'rb') as f:
-            raw = f.read()
-    except OSError:
-        return None
-
-    header = parse_header_only(raw)
-    if header is None or header['game_id'] is None:
-        return None
-    if header.get('mode_id') != MODE_ID:
-        return None
-
-    picks, candidates, results = parse_events(raw, header)
-    rows = build_rows(raw, header, picks, candidates, results, mapping)
-    if not rows:
-        return None
-
-    players = []
-    for r in rows:
-        players.append({
-            'seat':       int(r['座位']),
-            'name':       r['玩家昵称'],
-            'userId':     r['UserID'],
-            'rank':       r['官阶'],
-            'general':    r['选将'],
-            'camp':       r['阵营'],
-            'result':     r['胜负'],
-            'candidates': [c.strip() for c in r['出框武将'].split(',') if c.strip()] if r['出框武将'] else [],
-            'rankScore':  int(r['官阶积分']) if r['官阶积分'] else None,
-            'elo':        int(r['Elo']) if r['Elo'] else None,
-        })
-    return {'players': players}
-
+# ─────────────────── index 标记已解析 ───────────────────
 
 def update_index(quiet=False):
-    """从 index_ranked.json 中找 replayDownloaded=True 且 parsed=null 的 game，
-    解析对应 .sgs 文件，回写 parsed 字段。
-    """
+    """将 index_ranked.json 中已解析的 game 标记 parsed=true（从 SQLite 读取已解析列表）。"""
     if not INDEX_FILE.is_file():
-        print(f'❌ 索引文件不存在: {INDEX_FILE}')
+        if not quiet:
+            print('ℹ️  索引文件不存在，跳过标记')
         return
+
+    conn = get_conn()
+    parsed_ids = existing_game_ids(conn, 'ranked_2v2')
+    conn.close()
 
     with open(INDEX_FILE, 'r', encoding='utf-8') as f:
         index_data = json.load(f)
 
-    mapping = load_mapping()
-    to_parse = [
-        (gid, entry) for gid, entry in index_data.get('games', {}).items()
-        if entry.get('replayDownloaded') and entry.get('parsed') is None
-    ]
+    updated = 0
+    for gid, entry in index_data.get('games', {}).items():
+        if gid in parsed_ids and not entry.get('parsed'):
+            entry['parsed'] = True
+            updated += 1
 
-    if not to_parse:
-        print('ℹ️  没有需要解析的 2v2 录像')
-        return
+    if updated > 0:
+        with open(INDEX_FILE, 'w', encoding='utf-8') as f:
+            json.dump(index_data, f, ensure_ascii=False, indent=2)
 
-    print(f'📂 待解析: {len(to_parse)} 个 2v2 录像')
-    parsed_count = 0
-    failed_count = 0
-
-    for i, (gid, entry) in enumerate(to_parse, 1):
-        sgs_path = INPUT_DIR / f'{gid}.sgs'
-        result = parse_single_game(sgs_path, mapping)
-        if result:
-            entry['parsed'] = result
-            parsed_count += 1
-        else:
-            failed_count += 1
-
-        if not quiet and (i % 5000 == 0 or i == len(to_parse)):
-            print(f'  … {i}/{len(to_parse)} 已处理，成功 {parsed_count}')
-
-    with open(INDEX_FILE, 'w', encoding='utf-8') as f:
-        json.dump(index_data, f, ensure_ascii=False, indent=2)
-
-    print(f'✅ 索引更新: {parsed_count} 解析成功, {failed_count} 失败')
+    if not quiet:
+        print(f'📝 索引标记: {updated} 个 2v2 录像标记为已解析')
 
 
 # ─────────────────── 主流程 ───────────────────
@@ -243,23 +184,12 @@ def process(quiet=False):
 
     print(f'📂 发现 {len(sgs_files)} 个 .sgs 文件')
     mapping = load_mapping()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 加载已处理的 GameID
-    seen_ids = set()
-    if OUT_PATH.is_file():
-        with open(OUT_PATH, 'r', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
-                gid = row.get('GameID', '').strip()
-                if gid:
-                    seen_ids.add(gid)
-        print(f'🔍 已有 {len(seen_ids)} 个 GameID（跳过重复）')
-
-    first_run = not OUT_PATH.is_file()
-    csv_file  = open(OUT_PATH, 'w' if first_run else 'a', newline='', encoding='utf-8-sig')
-    writer    = csv.DictWriter(csv_file, fieldnames=HEADERS)
-    if first_run or OUT_PATH.stat().st_size == 0:
-        writer.writeheader()
+    conn = get_conn()
+    refresh_generals(conn)
+    seen_ids = existing_game_ids(conn, 'ranked_2v2')
+    if seen_ids:
+        print(f'🔍 数据库已有 {len(seen_ids)} 个 GameID（跳过重复）')
 
     buf = []
     total = skipped_dup = skipped_other = no_pattern = 0
@@ -267,8 +197,8 @@ def process(quiet=False):
     def flush():
         nonlocal buf
         if buf:
-            writer.writerows(buf)
-            csv_file.flush()
+            insert_ranked_2v2(conn, buf)
+            conn.commit()
             buf = []
 
     try:
@@ -296,7 +226,7 @@ def process(quiet=False):
             picks, candidates, results = parse_events(raw, header)
             rows = build_rows(raw, header, picks, candidates, results, mapping)
 
-            if rows and rows[0]['阵营'] == '未知':
+            if rows and rows[0]['camp'] == '未知':
                 no_pattern += 1
 
             buf.extend(rows)
@@ -307,7 +237,7 @@ def process(quiet=False):
 
         flush()
     finally:
-        csv_file.close()
+        conn.close()
 
     print(f'\n✅ 完成！解析 {total} 场（{total * PLAYER_COUNT} 行）')
     if skipped_dup:
@@ -316,7 +246,7 @@ def process(quiet=False):
         print(f'⚠️  跳过无效/非2v2 {skipped_other} 个')
     if no_pattern:
         print(f'⚠️  {no_pattern} 局未能识别座次 Pattern')
-    print(f'📄 {OUT_PATH}')
+    print(f'💾 {DB_PATH}')
 
 
 if __name__ == '__main__':
