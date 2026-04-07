@@ -571,29 +571,34 @@ async function queryGameIds(page, account, userIds) {
             }
             const responses = await respPromise;
 
-            for (let j = 0; j < batch.length; j++) {
-                const uid = batch[j];
-                const resp = j < responses.length ? responses[j] : null;
-                if (resp) {
-                    const records = resp.payload?.recordData?.saveRecordList || [];
-                    const gameIds = records
-                        .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
-                        .map(r => ({
-                            gameId:      String(r.gameID),
-                            modeId:      modeToInt(r.modeID),
-                            gameTime:    r.gameStartTime || 0,
-                            result:      r.gameResult || '',
-                            isMvp:       !!r.isMvp,
-                            isEscape:    !!r.isEscape,
-                            figure:      r.figure || 0,
-                            generalId:   (r.usingCharacters || [])[0] || 0,
-                            scoreChange: r.scoreChange || 0,
-                        }))
-                        .filter(o => o.gameId && o.gameId !== '0' && !seen.has(o.gameId));
-                    for (const o of gameIds) seen.add(o.gameId);
-                    results.push({ userId: uid, gameIds });
-                } else {
-                    results.push({ userId: uid, gameIds: [] });
+            // 从响应 payload.userID 读取真实 userId，不依赖请求顺序
+            const matched = new Set();
+            for (const resp of responses) {
+                const uid = String(resp.payload?.userID || '');
+                if (!uid || matched.has(uid)) continue;
+                matched.add(uid);
+                const records = resp.payload?.recordData?.saveRecordList || [];
+                const gameIds = records
+                    .filter(r => keepModes.length === 0 || keepModes.includes(modeToInt(r.modeID)))
+                    .map(r => ({
+                        gameId:      String(r.gameID),
+                        modeId:      modeToInt(r.modeID),
+                        gameTime:    r.gameStartTime || 0,
+                        result:      r.gameResult || '',
+                        isMvp:       !!r.isMvp,
+                        isEscape:    !!r.isEscape,
+                        figure:      r.figure || 0,
+                        generalId:   (r.usingCharacters || [])[0] || 0,
+                        scoreChange: r.scoreChange || 0,
+                    }))
+                    .filter(o => o.gameId && o.gameId !== '0' && !seen.has(o.gameId));
+                for (const o of gameIds) seen.add(o.gameId);
+                results.push({ userId: uid, gameIds });
+            }
+            // 未收到响应的 userId 记为空
+            for (const uid of batch) {
+                if (!matched.has(String(uid))) {
+                    results.push({ userId: String(uid), gameIds: [] });
                 }
             }
 
