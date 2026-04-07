@@ -1,11 +1,14 @@
-name: Daily Pipeline
+name: Boards Pipeline
 
 on:
   schedule:
-    # 每 2 小时跑一次（公开仓库不限分钟数）
-    # 账号按当前小时对账号数取模轮替，支持任意数量账号
-    - cron: '0 */2 * * *'
-  workflow_dispatch:        # 支持手动触发
+    # 每 1 小时跑一次（榜单线）
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sgs-collect
+  cancel-in-progress: false
 
 jobs:
   pipeline:
@@ -15,7 +18,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Node.js（Puppeteer 采集）
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -24,7 +26,6 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
-      # ── Python（下载 + 解析 + 同步）
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -34,7 +35,6 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # ── 从 R2 拉取状态（output/ + indexes/ + cache/）
       - name: Pull state from R2
         env:
           R2_ENDPOINT:          ${{ secrets.R2_ENDPOINT }}
@@ -43,34 +43,30 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python pipeline/sync_r2.py --pull
 
-      # ── Puppeteer 采集：官阶榜 + 省级排位 + 省级身份排位 + 好友推荐 → GameID
-      #    榜单每日自动缓存（data/cache/boards_*.json），好友每次重新刷
-      - name: Collect GameIDs
+      - name: Collect GameIDs (boards)
         env:
           SGS_ACCOUNTS:   ${{ secrets.SGS_ACCOUNTS || secrets.SGS_ACCOUNT }}
           SGS_PASSWORDS:  ${{ secrets.SGS_PASSWORDS || secrets.SGS_PASSWORD }}
           KEEP_MODES:     '4,8,36'
           PROVINCE_MAX:   '33'
-          FRIEND_ROUNDS:  '300'
           REQUEST_DELAY:  '300'
-        run: node collect/collect.js
+        run: node collect/collect.js --mode=boards
 
-      # ── 合并索引 + 连续对局检测
       - name: Merge indexes
         run: python pipeline/merge_indexes.py
 
-      # ── 下载录像（从索引读取，跳过身份 mode 4，只取最近 7 天）
       - name: Download replays
         run: python pipeline/download.py --use-indexes --days=7
 
-      # ── 解析 + 回写 parsed 到 index JSON
+      - name: Reparse missing replays
+        run: python pipeline/download.py --reparse --days=7
+
       - name: Parse 2v2
         run: python pipeline/parse_2v2.py --quiet --update-index
 
       - name: Parse Doudizhu
         run: python pipeline/parse_doudizhu.py --quiet --update-index
 
-      # ── 逃跑玩家官阶补全（parse 后、push 前）
       - name: Enrich escaped player ranks
         env:
           SGS_ACCOUNTS:   ${{ secrets.SGS_ACCOUNTS || secrets.SGS_ACCOUNT }}
@@ -78,11 +74,9 @@ jobs:
           REQUEST_DELAY:  '300'
         run: python pipeline/enrich_ranks.py
 
-      # ── DB → CSV 同步（确保 CSV 是 DB 的完整镜像）
       - name: Export CSV from DB
         run: python pipeline/export_csv.py
 
-      # ── 上传结果回 R2（output/ + indexes/ + cache/）
       - name: Push results to R2
         env:
           R2_ENDPOINT:          ${{ secrets.R2_ENDPOINT }}
@@ -91,7 +85,6 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python pipeline/sync_r2.py --push
 
-      # ── 清理过期数据（R2 + 本地）
       - name: Cleanup old data
         env:
           R2_ENDPOINT:          ${{ secrets.R2_ENDPOINT }}
