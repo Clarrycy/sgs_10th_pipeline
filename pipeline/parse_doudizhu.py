@@ -3,7 +3,7 @@
 SGS 斗地主录像解析（mode=36，3人）
 
 输入:  data/replays/斗地主/*.sgs
-输出:  data/output/parsed_doudizhu.csv（增量 append + 去重）
+输出:  data/sgs.db（SQLite，由 export_csv.py 导出 CSV）
 
 地主判定：叫分事件 (MSG_BID) 中叫分最高者为地主（~5.2% 非 seat 0）。
 农民同胜负；与地主对立。
@@ -16,7 +16,6 @@ SGS 斗地主录像解析（mode=36，3人）
 
 import json
 import sys
-import csv
 import argparse
 from pathlib import Path
 
@@ -98,9 +97,10 @@ def update_index(quiet=False):
 
     updated = 0
     for gid, entry in index_data.get('games', {}).items():
-        if gid in parsed_ids and not entry.get('parsed'):
-            entry['parsed'] = True
-            updated += 1
+        if gid in parsed_ids:
+            if entry.get('parsed') is not True:
+                entry['parsed'] = True
+                updated += 1
 
     if updated > 0:
         with open(INDEX_FILE, 'w', encoding='utf-8') as f:

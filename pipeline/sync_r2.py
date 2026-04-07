@@ -81,7 +81,7 @@ def push(include_replays=False):
 
     # 上传 data/output/ (CSV)
     output_files = list(OUTPUT_DIR.glob('*'))
-    data_files = [f for f in output_files if f.suffix == '.csv' and f.is_file()]
+    data_files = [f for f in output_files if f.suffix == '.csv' and f.is_file() and f.name != 'index.csv']
     # sgs.db 统一从 data/sgs.db 上传（db.py 写入路径），避免与 data/output/sgs.db 冲突
     db_file = ROOT / 'data' / 'sgs.db'
     if db_file.is_file():

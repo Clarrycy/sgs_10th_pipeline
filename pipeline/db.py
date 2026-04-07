@@ -104,7 +104,7 @@ def get_conn():
 
 def _migrate(conn):
     """增量迁移：为已有表补充新列。"""
-    # doudizhu.rank_score — 斗地主积分（2026-04-06 新增）
+    # doudizhu.rank_score — 斗地主积分 (header f15.f1, 2026-04-06 新增)
     try:
         conn.execute("SELECT rank_score FROM doudizhu LIMIT 0")
     except sqlite3.OperationalError:

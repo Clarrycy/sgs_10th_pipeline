@@ -3,7 +3,7 @@
 SGS 2v2 排位录像解析（mode=8，4人）
 
 输入:  data/replays/2v2/*.sgs
-输出:  data/output/parsed_2v2.csv（首次创建，后续增量 append + 去重）
+输出:  data/sgs.db（SQLite，由 export_csv.py 导出 CSV）
 
 座次判定:
   事件 0xBB935C80 payload[1]==0x02 → Pattern A（忠先手）
@@ -19,9 +19,7 @@ SGS 2v2 排位录像解析（mode=8，4人）
 """
 
 import json
-import os
 import sys
-import csv
 import shutil
 import argparse
 from pathlib import Path
@@ -164,9 +162,10 @@ def update_index(quiet=False):
 
     updated = 0
     for gid, entry in index_data.get('games', {}).items():
-        if gid in parsed_ids and not entry.get('parsed'):
-            entry['parsed'] = True
-            updated += 1
+        if gid in parsed_ids:
+            if entry.get('parsed') is not True:
+                entry['parsed'] = True
+                updated += 1
 
     if updated > 0:
         with open(INDEX_FILE, 'w', encoding='utf-8') as f:

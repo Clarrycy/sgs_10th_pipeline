@@ -27,7 +27,7 @@ RANKED_2V2_COLS = [
 
 DOUDIZHU_COLS = [
     'GameID', '对局时间', '座位', '玩家昵称', 'UserID', '官阶',
-    '选将ID', '选将', '阵营', '胜负', '初始出框', '换走', '换入',
+    '选将', '阵营', '胜负', '初始出框', '换走', '换入', '斗地主积分',
 ]
 
 
@@ -92,8 +92,9 @@ def export_doudizhu(conn):
             general_str = f'{gen_name}({gen_id})' if gen_name else str(gen_id or '')
             writer.writerow([
                 gid, gtime, seat, pname, uid, rank or '',
-                gen_id or '', general_str, camp, result,
+                general_str, camp, result,
                 cands or '', swp_out or '', swp_in or '',
+                rscore if rscore is not None else '',
             ])
             count += 1
 

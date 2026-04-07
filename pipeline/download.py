@@ -116,13 +116,15 @@ def replay_subdir(mode):
 # ─────────────────── index.csv 管理 ───────────────────
 
 def load_index():
-    """加载已有 index.csv → set of GameID strings"""
+    """加载已有 index.csv → set of GameID strings（跳过失败记录，允许重试）"""
     existing = set()
     if INDEX_PATH.is_file():
         with open(INDEX_PATH, 'r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
                 gid = row.get('GameID', '').strip()
-                if gid:
+                mode = row.get('模式', '').strip()
+                # 跳过 404 / 过滤等失败记录，允许后续重试
+                if gid and not mode.startswith('http_') and not mode.startswith('skip_'):
                     existing.add(gid)
     return existing
 
